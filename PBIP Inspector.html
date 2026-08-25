@@ -2451,9 +2451,13 @@ function countUnused() {
   if (!App.state.usage) return 0;
   const visSet = new Set(visibleTables().map(t => t.name));
   let n = 0;
-  for (const e of Object.values(App.state.usage.byKey)) {
+  for (const [key, e] of Object.entries(App.state.usage.byKey)) {
     if (!visSet.has(e.table)) continue;
-    if (e.direct.length === 0 && e.transitive.length === 0) n++;
+    // Count only TRULY unused entities, matching the "N unused" figure in the tab's
+    // own toolbar. Items referenced solely by a relationship, sortByColumn, or a
+    // hierarchy level are "structural only" — they ARE referenced, are usually safe
+    // to keep, and stay behind the tab's "Show structural-only" toggle.
+    if (usageStatus(key) === 'unused') n++;
   }
   return n;
 }
