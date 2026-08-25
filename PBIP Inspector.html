@@ -441,6 +441,13 @@ body {
   max-height: 280px; overflow: auto;
   line-height: 1.5;
 }
+/* ── Power Query step list (Tables ▸ Query Steps) ── */
+.m-step { border: 1px solid var(--border); border-radius: 6px; margin-bottom: 8px; background: var(--bg-2); overflow: hidden; }
+.m-step-head { display: flex; align-items: center; gap: 8px; padding: 6px 10px; background: var(--bg-3); border-bottom: 1px solid var(--border); }
+.m-step-num { font-family: var(--mono); font-size: 10px; font-weight: 600; color: #fff; background: var(--green-mid); border-radius: 3px; min-width: 20px; text-align: center; padding: 1px 5px; flex-shrink: 0; }
+.m-step-name { font-family: var(--mono); font-size: 12px; font-weight: 600; color: var(--text); word-break: break-all; }
+.m-step-note { font-size: 11px; color: var(--text-3); font-style: italic; margin-left: auto; text-align: right; }
+.m-step .m-code { margin: 0; border: 0; border-radius: 0; background: var(--bg-2); max-height: 200px; }
 .chip-row { display: flex; flex-wrap: wrap; gap: 6px; }
 .chip {
   background: var(--bg-3);
@@ -2961,6 +2968,8 @@ function renderTableDetail() {
   // Extract inline data and SQL from M code (only meaningful for M-based partitions)
   const inlineData = (kind === 'm') ? extractInlineData(t.partitionSource) : null;
   const sqlQueries = (kind === 'm') ? extractSqlFromM(t.partitionSource) : [];
+  // The partition's `let … in …` broken into individual steps (null = not a let-block)
+  const mSteps = (kind === 'm') ? parseMSteps(t.partitionSource) : null;
   // Compressed inline data (base64 + deflate, what Power BI emits for "Enter Data" tables)
   const compressedInline = (kind === 'm' && !inlineData) ? detectCompressedInline(t.partitionSource) : null;
 
@@ -3063,6 +3072,25 @@ function renderTableDetail() {
             </div>
             <pre class="measure-dax">${esc(ci.dax)}</pre>
             ${ci.formatStringDefinition ? `<div style="margin-top:6px"><div style="font-size:10px;font-weight:600;color:var(--text-2);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:4px">Format String Definition</div><pre class="measure-dax" style="border-left:3px solid var(--yellow-accent,#c49000)">${esc(ci.formatStringDefinition)}</pre></div>` : ''}
+          </div>
+        `).join('')}
+      </div>
+    </div>
+    ` : ''}
+
+    ${mSteps ? `
+    <div class="subsection">
+      <div class="subsection-header open"><span class="arrow">▶</span>Query Steps <span class="pill">${mSteps.steps.length} step${mSteps.steps.length===1?'':'s'}</span></div>
+      <div class="subsection-body">
+        ${mSteps.steps.map((s, i) => `
+          <div class="m-step">
+            <div class="m-step-head">
+              <span class="m-step-num">${i + 1}</span>
+              <span class="m-step-name">${esc(s.name)}</span>
+              ${s.name === mSteps.result ? '<span class="pill">output</span>' : ''}
+              ${s.note ? `<span class="m-step-note">${esc(s.note)}</span>` : ''}
+            </div>
+            <pre class="m-code">${esc(s.expr)}</pre>
           </div>
         `).join('')}
       </div>
@@ -4425,6 +4453,96 @@ function extractRecordsFromBrace(text) {
   }
   return out;
 }
+/* ── Power Query step splitting ──
+   Walk M source reporting bracket depth, skipping string literals ("" escapes and
+   #"quoted identifiers") and both comment forms. Callback returning false stops the
+   scan. This is what lets a `let … in …` be split on its real step boundaries: the
+   SQL inside a Value.NativeQuery is full of commas that must NOT be treated as one. */
+function eachMToken(text, cb) {
+  let depth = 0, i = 0;
+  while (i < text.length) {
+    const c = text[i];
+    if (c === '"') {
+      i++;
+      while (i < text.length) {
+        if (text[i] === '"') { if (text[i + 1] === '"') { i += 2; continue; } i++; break; }
+        i++;
+      }
+      continue;
+    }
+    if (c === '/' && text[i + 1] === '/') { while (i < text.length && text[i] !== '\n') i++; continue; }
+    if (c === '/' && text[i + 1] === '*') { i += 2; while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++; i += 2; continue; }
+    if ('[{('.includes(c)) { depth++; i++; continue; }
+    if (']})'.includes(c)) { depth--; i++; continue; }
+    if (cb(i, c, depth) === false) return;
+    i++;
+  }
+}
+function isMWordChar(ch) { return !!ch && /[A-Za-z0-9_.]/.test(ch); }
+function mKeywordAt(text, i, kw) {
+  return text.startsWith(kw, i) && !isMWordChar(text[i - 1]) && !isMWordChar(text[i + kw.length]);
+}
+
+/* Split a partition's `let … in …` into its individual steps, the way Power Query's
+   Applied Steps pane lists them. Returns null when the M isn't a let-block (a
+   single-expression partition has no steps to show) — callers fall back to raw M. */
+function parseMSteps(mCode) {
+  const src = String(mCode || '').trim();
+  if (!/^let\b/.test(src)) return null;
+
+  // Find the `in` closing THIS let — a step may contain its own nested let…in.
+  let letDepth = 1, inPos = -1;
+  eachMToken(src, (i, c, depth) => {
+    if (depth !== 0 || i < 3) return;
+    if (c === 'l' && mKeywordAt(src, i, 'let')) letDepth++;
+    else if (c === 'i' && mKeywordAt(src, i, 'in')) { letDepth--; if (letDepth === 0) { inPos = i; return false; } }
+  });
+  if (inPos < 0) return null;
+
+  // Cut on commas at bracket depth 0 that are also outside any nested let…in.
+  const body = src.slice(3, inPos);
+  const cuts = [];
+  let nest = 0;
+  eachMToken(body, (i, c, depth) => {
+    if (depth !== 0) return;
+    if (c === 'l' && mKeywordAt(body, i, 'let')) nest++;
+    else if (c === 'i' && mKeywordAt(body, i, 'in')) { if (nest > 0) nest--; }
+    else if (c === ',' && nest === 0) cuts.push(i);
+  });
+  const parts = [];
+  let start = 0;
+  for (const cut of cuts) { parts.push(body.slice(start, cut)); start = cut + 1; }
+  parts.push(body.slice(start));
+
+  const steps = [];
+  for (const raw of parts) {
+    // A leading comment is how Power Query stores a step description — peel it off
+    // the name and keep it as the step's note.
+    let part = raw.trim(), note = '';
+    for (;;) {
+      if (part.startsWith('//')) {
+        const nl = part.indexOf('\n');
+        note += (note ? ' ' : '') + part.slice(2, nl < 0 ? undefined : nl).trim();
+        part = (nl < 0 ? '' : part.slice(nl + 1)).trim();
+      } else if (part.startsWith('/*')) {
+        const end = part.indexOf('*/');
+        note += (note ? ' ' : '') + part.slice(2, end < 0 ? undefined : end).trim();
+        part = (end < 0 ? '' : part.slice(end + 2)).trim();
+      } else break;
+    }
+    if (!part) continue;
+    let eq = -1;
+    eachMToken(part, (i, c, depth) => {
+      if (c === '=' && depth === 0 && part[i + 1] !== '=' && part[i + 1] !== '>' && part[i - 1] !== '<' && part[i - 1] !== '>') { eq = i; return false; }
+    });
+    // No top-level `=` — fold it back into the previous step rather than lose it.
+    if (eq < 0) { if (steps.length) steps[steps.length - 1].expr += ',' + part; continue; }
+    steps.push({ name: stripIdQuotes(part.slice(0, eq).trim()), expr: part.slice(eq + 1).trim(), note });
+  }
+  if (!steps.length) return null;
+  return { steps, result: stripIdQuotes(src.slice(inPos + 2).trim()) };
+}
+
 function stripIdQuotes(id) {
   id = (id || '').trim();
   const m = id.match(/^#?"(.+)"$/);
