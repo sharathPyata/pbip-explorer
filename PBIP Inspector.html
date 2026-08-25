@@ -1151,9 +1151,21 @@ const App = {
 /* ═══════════════════════════════════════════════════════════════
    TMDL PARSING
    ═══════════════════════════════════════════════════════════════ */
+/* TMDL files saved by Power BI Desktop on Windows use CRLF, and some tools emit a
+   UTF-8 BOM. Both break the per-line parsers below: JavaScript treats \r as a line
+   terminator, so `.` can't match it and a non-multiline `$` won't match before it —
+   which silently drops every single-line and backtick-fenced `measure X = ...`
+   declaration (only the bare `measure X =` + indented-body form survived). A leading
+   BOM likewise defeats the `^table` match and drops the whole file. Normalize once,
+   at read time, so every downstream parser sees clean LF text. */
+function normTmdl(text) {
+  return (text || '').replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
+}
 function unquote(name) {
   name = (name || '').trim();
-  if (name.length >= 2 && name.startsWith("'") && name.endsWith("'")) return name.slice(1, -1);
+  // TMDL escapes an embedded ' by doubling it ('Client''s Spend') — undo that so the
+  // name matches what DAX references ([Client's Spend]).
+  if (name.length >= 2 && name.startsWith("'") && name.endsWith("'")) return name.slice(1, -1).replace(/''/g, "'");
   return name;
 }
 function extractLeadingComment(text) {
@@ -2488,7 +2500,7 @@ async function processFiles(fileList) {
   // Read relevant files
   const readText = async (path) => {
     if (!byPath[path]) return '';
-    return await byPath[path].text();
+    return normTmdl(await byPath[path].text());
   };
 
   const modelText = await readText(`${smRoot}/definition/model.tmdl`);
@@ -2508,7 +2520,7 @@ async function processFiles(fileList) {
   const tables = [];
   const tablePathRe = new RegExp(`^${escRe(smRoot)}/definition/tables/.+\\.tmdl$`);
   const tablePaths = Object.keys(byPath).filter(p => tablePathRe.test(p));
-  const tableTexts = await Promise.all(tablePaths.map(p => byPath[p].text()));
+  const tableTexts = (await Promise.all(tablePaths.map(p => byPath[p].text()))).map(normTmdl);
   for (const text of tableTexts) {
     const t = parseTable(text);
     if (t) tables.push(t);
