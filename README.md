@@ -131,7 +131,9 @@ PBIP Explorer reads the `.SemanticModel/definition/*.tmdl` files for the data mo
 | SharePoint | `SharePoint.Files` / `SharePoint.Tables` / `SharePoint.Lists` |
 | Excel | `Excel.Workbook(File.Contents(...))` |
 | Web / API | `Web.Contents` / `Json.Document` / `OData.Feed` |
+| Analysis Services / Power BI model | `AnalysisServices.Databases` / `PowerBI.Datasets` — a live connection to another semantic model |
 | Inline | `Table.FromRecords` / `Table.FromRows` (incl. base64+deflate compressed) |
+| Computed | `#table` / `Table.FromValue` / `List.Numbers` — no external source at all |
 
 Multiple expressions pointing to the same host collapse into one source card.
 

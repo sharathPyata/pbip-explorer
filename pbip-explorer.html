@@ -410,6 +410,7 @@ body {
 .source-type-badge.excel { background: var(--green-badge); color: var(--green-dark); }
 .source-type-badge.dataverse { background: var(--purple-light); color: var(--purple); }
 .source-type-badge.api { background: #ffe5cc; color: var(--orange); }
+.source-type-badge.analysis-services { background: var(--yellow-badge); color: var(--yellow-text); }
 .source-type-badge.other { background: #e9ecef; color: #495057; }
 .source-name { font-size: 15px; font-weight: 600; }
 .source-server { font-family: var(--mono); font-size: 12px; color: var(--text-2); }
@@ -1935,13 +1936,19 @@ function detectSource(mCode, expressions, tablesList, visited) {
       }
     }
   }
+  // No connector and no upstream table: if the query manufactures its own rows
+  // (#table / Table.FromValue / a generated list) it genuinely has no external
+  // source, which is worth distinguishing from an unrecognised connector.
+  if (/#table\s*\(|Table\.FromValue\s*\(|List\.(?:Numbers|Dates|Generate)\s*\(/.test(mCode)) {
+    return { key: 'computed', name: 'Computed', type: 'other', server: 'No external source' };
+  }
   return { key: 'unknown', name: 'Unknown', type: 'other', server: '' };
 }
 
 /* Collapse different expressions/tables that share the same underlying connection into one card. */
 function sourceGroupKey(info) {
   if (!info) return 'unknown';
-  const passthrough = ['calc:calculated', 'calc:group', 'auto-date', 'inline', 'unknown'];
+  const passthrough = ['calc:calculated', 'calc:group', 'auto-date', 'inline', 'computed', 'unknown'];
   if (passthrough.includes(info.key)) return info.key;
   let host = info.server || '';
   const slash = host.indexOf(' / ');
@@ -1956,6 +1963,7 @@ function sourceGroupName(info) {
   if (info.key === 'calc:group') return 'Calculation Groups';
   if (info.key === 'auto-date') return 'Auto Date Tables';
   if (info.key === 'inline') return 'Inline Data';
+  if (info.key === 'computed') return 'Computed (no external source)';
   if (info.key === 'unknown') return 'Unknown';
   let host = info.server || '';
   const slash = host.indexOf(' / ');
@@ -2022,6 +2030,8 @@ function fromM(mCode, keyPrefix, nameOverride) {
     [/Sql\.Databases?\s*\(\s*"([^"]+)"/, 'sql-server'],
     [/Oracle\.Database\s*\(\s*"([^"]+)"/, 'oracle'],
     [/Snowflake\.Databases?\s*\(\s*"([^"]+)"/, 'snowflake'],
+    [/AnalysisServices\.Databases?\s*\(\s*"([^"]+)"\s*(?:,\s*"([^"]+)")?/, 'analysis-services'],
+    [/PowerBI\.Datasets?\s*\(\s*"([^"]+)"\s*(?:,\s*"([^"]+)")?/, 'analysis-services'],
     [/PostgreSQL\.Database\s*\(\s*"([^"]+)"/, 'other'],
     [/MySQL\.Database\s*\(\s*"([^"]+)"/, 'other'],
   ];
@@ -2941,7 +2951,7 @@ function renderTables() {
   // Sort groups: real data sources first (alphabetical by name), then calc/auto-date/inline/unknown.
   // Within each group, tables are alphabetical (vTables is already sorted that way upstream,
   // but sort again here so any future change to ordering doesn't silently break this).
-  const GROUP_PRIORITY = { 'calc:calculated': 100, 'calc:group': 101, 'auto-date': 102, 'inline': 103, 'unknown': 104 };
+  const GROUP_PRIORITY = { 'calc:calculated': 100, 'calc:group': 101, 'auto-date': 102, 'inline': 103, 'computed': 104, 'unknown': 105 };
   const sortedGroups = Object.values(groups).sort((a, b) => {
     const pa = GROUP_PRIORITY[a.src.key] ?? 0;
     const pb = GROUP_PRIORITY[b.src.key] ?? 0;
@@ -2979,7 +2989,23 @@ function renderTables() {
   c.querySelectorAll('.tables-list-item').forEach(el => {
     el.onclick = () => setActiveTableInList(el.dataset.name);
   });
+  // Arriving here from a Sources chip rebuilds the list, which resets the rail to the
+  // top — bring the selected table into view so it isn't invisibly selected.
+  scrollActiveTableIntoView();
   renderTableDetail();
+}
+
+/* Scroll the selected row into view, but only when it's actually off-screen, so an
+   in-view selection never yanks the rail around. */
+function scrollActiveTableIntoView() {
+  const c = App.els.tablesContent;
+  if (!c) return;
+  const active = c.querySelector('.tables-list-item.active');
+  const list = c.querySelector('.tables-list');
+  if (!active || !list) return;
+  const ar = active.getBoundingClientRect();
+  const lr = list.getBoundingClientRect();
+  if (ar.top < lr.top || ar.bottom > lr.bottom) active.scrollIntoView({ block: 'nearest' });
 }
 
 /* Update the active table selection without rebuilding the list, so the user's
@@ -2992,16 +3018,7 @@ function setActiveTableInList(name) {
   c.querySelectorAll('.tables-list-item').forEach(el => {
     el.classList.toggle('active', el.dataset.name === name);
   });
-  // Scroll into view if off-screen
-  const active = c.querySelector('.tables-list-item.active');
-  const list = c.querySelector('.tables-list');
-  if (active && list) {
-    const ar = active.getBoundingClientRect();
-    const lr = list.getBoundingClientRect();
-    if (ar.top < lr.top || ar.bottom > lr.bottom) {
-      active.scrollIntoView({ block: 'nearest' });
-    }
-  }
+  scrollActiveTableIntoView();
   renderTableDetail();
 }
 
@@ -4087,7 +4104,9 @@ function renderNotes() {
         <tr><td>SharePoint</td><td><code>SharePoint.&lt;Files|Tables|Lists&gt;("url")</code></td><td>sharepoint</td></tr>
         <tr><td>Excel</td><td><code>Excel.Workbook(File.Contents("path"))</code></td><td>excel</td></tr>
         <tr><td>Web / API</td><td><code>Web.Contents / Json.Document / OData.Feed("url")</code></td><td>api</td></tr>
+        <tr><td>Analysis Services / Power BI semantic model</td><td><code>AnalysisServices.Databases("powerbi://...") / PowerBI.Datasets</code> — a live/DirectQuery connection to another model</td><td>analysis-services</td></tr>
         <tr><td>PostgreSQL / MySQL</td><td><code>PostgreSQL.Database / MySQL.Database</code></td><td>other</td></tr>
+        <tr><td>Computed</td><td>No connector and no upstream table, but the query builds its own rows (<code>#table</code>, <code>Table.FromValue</code>, <code>List.Numbers/Dates/Generate</code>) — grouped as "Computed (no external source)" rather than Unknown</td><td>other</td></tr>
       </tbody>
     </table>
 
