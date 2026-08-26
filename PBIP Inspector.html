@@ -1231,14 +1231,20 @@ function parseTable(text) {
   let cm;
   while ((cm = colRe.exec(text))) {
     const raw = cm[1].trimEnd();
-    let colName = '', calcDax = '';
+    let colName = '', after = '', hadEq = false;
     if (raw.startsWith("'")) {
-      // Quoted name — find closing quote, then optional `= DAX` after
-      const close = raw.indexOf("'", 1);
+      // Quoted name — find the closing quote, then an optional `= DAX` after it.
+      // An apostrophe inside the name is escaped by doubling it, so '' is not the end.
+      let close = -1;
+      for (let k = 1; k < raw.length; k++) {
+        if (raw[k] !== "'") continue;
+        if (raw[k + 1] === "'") { k++; continue; }
+        close = k; break;
+      }
       if (close > 0) {
         colName = raw.slice(1, close).replace(/''/g, "'");   // unescape '' → '
-        const after = raw.slice(close + 1).trim();
-        if (after.startsWith('=')) calcDax = after.slice(1).trim();
+        const tail = raw.slice(close + 1).trim();
+        if (tail.startsWith('=')) { hadEq = true; after = tail.slice(1).trim(); }
       } else {
         colName = raw;
       }
@@ -1247,19 +1253,52 @@ function parseTable(text) {
       const eq = raw.indexOf('=');
       if (eq > 0) {
         colName = raw.slice(0, eq).trim();
-        calcDax = raw.slice(eq + 1).trim();
+        hadEq = true;
+        after = raw.slice(eq + 1).trim();
       } else {
         colName = raw.trim();
       }
-    }
-    // Strip backtick fences if the DAX is wrapped in them (single-line case)
-    if (calcDax.startsWith('```') && calcDax.endsWith('```') && calcDax.length > 6) {
-      calcDax = calcDax.slice(3, -3).trim();
     }
 
     // Look ahead for props
     const start = cm.index + cm[0].length;
     const rest = text.slice(start);
+
+    // A calculated column's DAX takes the same three shapes a measure's does:
+    // single-line, ```-fenced, or a body on the following indented lines. Reading only
+    // the declaration line captured just the first, so a fenced column yielded the bare
+    // fence "```" as its DAX — and any column referenced ONLY from inside such a body
+    // (very common for FORMAT/SWITCH formatter columns) was then reported as unused.
+    let calcDax = '';
+    const restLines = rest.split('\n').slice(1);
+    if (after.startsWith('```')) {
+      if (after.length > 6 && after.endsWith('```')) {
+        calcDax = after.slice(3, -3).trim();          // opened and closed on one line
+      } else {
+        const parts = [];
+        const head = after.slice(3);
+        if (head.trim()) parts.push(head);
+        for (const ln of restLines) {
+          if (ln.includes('```')) {
+            const before = ln.split('```')[0];
+            if (before.trim()) parts.push(before);
+            break;
+          }
+          parts.push(ln);
+        }
+        calcDax = normalizeIndent(parts.join('\n')).trim();
+      }
+    } else if (hadEq && !after) {
+      const parts = [];
+      for (const ln of restLines) {
+        if (!ln.trim()) { if (parts.length) parts.push(''); continue; }
+        if (isPropertyLine(ln) || isTopLevelLine(ln)) break;
+        parts.push(ln);
+      }
+      calcDax = normalizeIndent(parts.join('\n')).trim();
+    } else {
+      calcDax = after;                                 // single-line (or not calculated)
+    }
     const propsBlock = rest.split(/\n(?=\t[a-z])/)[0]; // up to next top-level child
     const dataType = (propsBlock.match(/\n\t\tdataType:\s*(\w+)/) || [])[1] || '';
     const isHidden = /\n\t\tisHidden\b/.test(propsBlock);
@@ -1550,9 +1589,22 @@ function parseTable(text) {
 }
 
 /* Classify a table's "kind" for display (M / Calculated / Calc Group / Auto Date / Date Template) */
+/* TMDL annotation values aren't normalized: Power BI writes booleans as `= 1` in
+   some places and `= true` in others (and a quoted "true" turns up too). Test for
+   truthiness rather than one literal. */
+function annIsTrue(v) {
+  if (v == null) return false;
+  const s = String(v).trim().toLowerCase().replace(/^"(.*)"$/, '$1');
+  return s === '1' || s === 'true';
+}
 function tableKind(t) {
-  if (t.annotations && t.annotations.__PBI_TemplateDateTable === '1') return 'date-template';
-  if (t.annotations && t.annotations.__PBI_LocalDateTable === '1') return 'auto-date';
+  const ann = t.annotations || {};
+  // Fall back to the name pattern (the same one isSystemTable uses) so auto-date
+  // tables are classified even when the annotation is missing or written a way we
+  // don't expect — otherwise they land in "Calculated Tables" and skew the Overview
+  // kind breakdown, the Sources grouping and the "Generated for" badge.
+  if (annIsTrue(ann.__PBI_TemplateDateTable) || /^DateTableTemplate/.test(t.name)) return 'date-template';
+  if (annIsTrue(ann.__PBI_LocalDateTable) || /^LocalDateTable[_-]/.test(t.name)) return 'auto-date';
   if (t.isCalcGroup) return 'calc-group';
   if (t.partitionKind === 'calculated') return 'calculated';
   if (t.partitionKind === 'm') return 'm';
@@ -2647,7 +2699,7 @@ function countHiddenTables() {
 }
 
 function updateCounts() {
-  App.els.cSources.textContent = App.state.sources.length;
+  App.els.cSources.textContent = visibleSources().length;
   App.els.cTables.textContent = visibleTables().length;
   App.els.cMeasures.textContent = countAllMeasures();
   const visNames = new Set(visibleTables().map(t => t.name));
@@ -2746,7 +2798,7 @@ function renderOverview() {
   const ann = App.state.modelAnnotations;
   const meta = [];
   if (ann.PBIDesktopVersion) meta.push(`<span><strong>Power BI Desktop:</strong> ${esc(ann.PBIDesktopVersion)}</span>`);
-  if (ann.__PBI_TimeIntelligenceEnabled) meta.push(`<span><strong>Time intelligence:</strong> ${ann.__PBI_TimeIntelligenceEnabled === '1' ? 'enabled' : 'disabled'}</span>`);
+  if (ann.__PBI_TimeIntelligenceEnabled) meta.push(`<span><strong>Time intelligence:</strong> ${annIsTrue(ann.__PBI_TimeIntelligenceEnabled) ? 'enabled' : 'disabled'}</span>`);
   if (ann.PBI_ProTooling) meta.push(`<span><strong>Tooling:</strong> <code>${esc(ann.PBI_ProTooling)}</code></span>`);
 
   const sourcesHtml = sources.map(s => {
@@ -2797,10 +2849,23 @@ function renderOverview() {
 /* ═══════════════════════════════════════════════════════════════
    RENDERING — SOURCES
    ═══════════════════════════════════════════════════════════════ */
+/* Sources with their table lists narrowed to what is currently visible, i.e. the
+   header's "Show N hidden" toggle. Power BI generates one hidden LocalDateTable_*
+   per date column (plus a DateTableTemplate_*); they exist only to back the built-in
+   date hierarchies and would otherwise flood the source cards' table chips. A source
+   left with no visible tables and no shared expressions is dropped entirely. */
+function visibleSources() {
+  const visNames = new Set(visibleTables().map(t => t.name));
+  return App.state.sources
+    .map(s => ({ ...s, queries: s.queries.filter(q => visNames.has(q)) }))
+    .filter(s => s.queries.length || (s.expressions && s.expressions.length));
+}
+
 function renderSources() {
   const c = App.els.sourcesContent;
-  if (!App.state.sources.length) { c.innerHTML = '<div class="card"><div class="card-body" style="color:var(--text-3)">No data sources to show</div></div>'; return; }
-  c.innerHTML = App.state.sources.map((s, idx) => `
+  const sources = visibleSources();
+  if (!sources.length) { c.innerHTML = '<div class="card"><div class="card-body" style="color:var(--text-3)">No data sources to show</div></div>'; return; }
+  c.innerHTML = sources.map((s, idx) => `
     <div class="source-card" data-idx="${idx}">
       <div class="source-head">
         <div class="source-head-left">
@@ -3153,28 +3218,6 @@ function renderTableDetail() {
       </div>
     </div>
     ` : ''}
-
-    ${(() => {
-      // Hide annotations that are either pure noise or already surfaced elsewhere (kind badge, etc.)
-      const STOCK = new Set(['__PBI_LocalDateTable', '__PBI_TemplateDateTable']);
-      const interesting = Object.entries(t.annotations || {}).filter(([k]) => !STOCK.has(k));
-      if (interesting.length === 0) return '';
-      return `
-    <div class="subsection">
-      <div class="subsection-header open"><span class="arrow">▶</span>Annotations <span class="pill">${interesting.length}</span></div>
-      <div class="subsection-body">
-        <table class="columns-table">
-          <thead><tr><th>Key</th><th>Value</th></tr></thead>
-          <tbody>
-            ${interesting.map(([k, v]) => `
-              <tr><td>${esc(k)}</td><td style="color:var(--text-2)">${esc(v)}</td></tr>
-            `).join('')}
-          </tbody>
-        </table>
-      </div>
-    </div>
-      `;
-    })()}
   `;
   root.querySelectorAll('.subsection-header').forEach(h => {
     h.onclick = () => h.classList.toggle('open');
@@ -4157,8 +4200,8 @@ function renderNotes() {
         <tr><td><strong>Power Query</strong></td><td><code>partition X = m</code></td></tr>
         <tr><td><strong>Calculated (DAX)</strong></td><td><code>partition X = calculated</code></td></tr>
         <tr><td><strong>Calculation Group</strong></td><td>has a <code>calculationGroup</code> block at table level</td></tr>
-        <tr><td><strong>Auto Date Table</strong></td><td>annotation <code>__PBI_LocalDateTable = 1</code></td></tr>
-        <tr><td><strong>Date Template</strong></td><td>annotation <code>__PBI_TemplateDateTable = 1</code></td></tr>
+        <tr><td><strong>Auto Date Table</strong></td><td>annotation <code>__PBI_LocalDateTable</code> (<code>1</code> or <code>true</code>), or a <code>LocalDateTable_*</code> name</td></tr>
+        <tr><td><strong>Date Template</strong></td><td>annotation <code>__PBI_TemplateDateTable</code> (<code>1</code> or <code>true</code>), or a <code>DateTableTemplate_*</code> name</td></tr>
       </tbody>
     </table>
 
@@ -4969,7 +5012,7 @@ function buildMarkdownExport(o) {
     const ann = s.modelAnnotations || {};
     const meta = [];
     if (ann.PBIDesktopVersion) meta.push(`- **Power BI Desktop:** ${ann.PBIDesktopVersion}`);
-    if (ann.__PBI_TimeIntelligenceEnabled) meta.push(`- **Time intelligence:** ${ann.__PBI_TimeIntelligenceEnabled === '1' ? 'enabled' : 'disabled'}`);
+    if (ann.__PBI_TimeIntelligenceEnabled) meta.push(`- **Time intelligence:** ${annIsTrue(ann.__PBI_TimeIntelligenceEnabled) ? 'enabled' : 'disabled'}`);
     if (ann.PBI_ProTooling) meta.push(`- **Tooling:** ${ann.PBI_ProTooling}`);
     if (meta.length) { push('**Model metadata**', ''); push(...meta); push(''); }
   }
