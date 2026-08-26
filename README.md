@@ -1,10 +1,10 @@
-# PBIP Inspector
+# PBIP Explorer
 
 A self-contained HTML **viewer, explorer, and analyzer** for **Power BI Project (PBIP)** folders. Drop a PBIP folder into the browser and the tool parses TMDL, reads DAX, explores M code, draws relationships, and flags unused fields — all locally, no upload.
 
 **No network calls. No uploads. No backend.** Open the HTML file, drop your folder, and inspect.
 
-🔗 **[Try it live](https://sharathpyata.github.io/pbip-inspector/)** — no install needed. Your PBIP never leaves your browser.
+🔗 **[Try it live](https://sharathpyata.github.io/pbip-explorer/)** — no install needed. Your PBIP never leaves your browser.
 
 ---
 
@@ -65,7 +65,7 @@ A self-contained HTML **viewer, explorer, and analyzer** for **Power BI Project 
 
 ## Quick start
 
-1. Open `PBIP Inspector.html` in a modern browser (Chrome / Edge 113+, Firefox 113+, or Safari 16.4+).
+1. Open `pbip-explorer.html` in a modern browser (Chrome / Edge 113+, Firefox 113+, or Safari 16.4+).
 2. **Drag** a PBIP folder into the page, or click **Pick a folder** and select one.
 3. Click through the tabs at the top.
 
@@ -90,7 +90,7 @@ My report/
     └── report.json
 ```
 
-PBIP Inspector reads the `.SemanticModel/definition/*.tmdl` files for the data model. Both report formats are auto-detected: the legacy single `.Report/report.json` and the newer **PBIR** per-file format (`.Report/definition/pages/[pageName]/visuals/[visualName]/visual.json`) introduced in 2026.
+PBIP Explorer reads the `.SemanticModel/definition/*.tmdl` files for the data model. Both report formats are auto-detected: the legacy single `.Report/report.json` and the newer **PBIR** per-file format (`.Report/definition/pages/[pageName]/visuals/[visualName]/visual.json`) introduced in 2026.
 
 ---
 
