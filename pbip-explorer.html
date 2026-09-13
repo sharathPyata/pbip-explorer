@@ -1086,60 +1086,6 @@ tr.row-unused td:first-child { font-style: italic; }
 .toast.error { border-color: var(--red); }
 .toast.success { border-color: var(--green); }
 @keyframes toastIn { from { opacity: 0; transform: translate(-50%, 12px); } to { opacity: 1; transform: translate(-50%, 0); } }
-
-/* ── Layout tab (wireframe) ───────────────────────────────────────────────── */
-.layout-toolbar {
-  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
-  padding: 12px 18px; border-bottom: 1px solid var(--border); background: var(--bg-2);
-}
-.layout-flag {
-  font-family: var(--mono); font-size: 10px; text-transform: uppercase; letter-spacing: .04em;
-  background: var(--green-lighter); color: var(--green-dark);
-  border: 1px solid var(--green-mid); border-radius: 3px; padding: 1px 5px;
-}
-.layout-note {
-  margin: 10px 18px 0; padding: 8px 12px; font-size: 12px; line-height: 1.5;
-  background: #fff8e1; border: 1px solid #f0d68a; border-left: 3px solid #d9a520;
-  border-radius: 4px; color: #5c4708;
-}
-.layout-canvas-wrap { padding: 18px; overflow: auto; }
-.layout-canvas {
-  position: relative; width: 100%; max-width: 1100px; margin: 0 auto;
-  background: var(--bg-2); border: 1px solid var(--border); border-radius: 4px;
-  background-image: linear-gradient(var(--border) 1px, transparent 1px),
-                    linear-gradient(90deg, var(--border) 1px, transparent 1px);
-  background-size: 10% 10%; box-shadow: var(--shadow-sm);
-}
-.wf-box {
-  position: absolute; overflow: hidden; display: flex; flex-direction: column; gap: 2px;
-  padding: 4px 6px; border: 1.5px solid var(--green-dark); border-radius: 3px;
-  background: rgba(255,255,255,0.88); box-sizing: border-box;
-}
-.wf-box:hover { border-color: var(--green-mid); background: var(--green-lighter); z-index: 999; }
-.wf-hidden {
-  border-style: dashed; border-color: var(--text-3);
-  background: repeating-linear-gradient(45deg, rgba(0,0,0,0.03) 0 6px, transparent 6px 12px);
-  opacity: .65;
-}
-.wf-group { border-style: dotted; border-width: 2px; background: transparent; }
-.wf-label {
-  font-size: 10px; font-weight: 600; color: var(--text); line-height: 1.2;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex-shrink: 0;
-}
-.wf-fields {
-  font-family: var(--mono); font-size: 9px; color: var(--text-3); line-height: 1.25;
-  overflow: hidden;
-}
-.layout-legend {
-  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
-  padding: 0 18px 18px; font-size: 11px; color: var(--text-2);
-}
-.lg-swatch {
-  display: inline-block; width: 16px; height: 10px; vertical-align: -1px;
-  border: 1.5px solid var(--green-dark); border-radius: 2px; background: rgba(255,255,255,.9);
-}
-.lg-swatch.lg-hidden { border-style: dashed; border-color: var(--text-3); opacity: .65; }
-.lg-swatch.lg-group { border-style: dotted; border-width: 2px; background: transparent; }
 </style>
 </head>
 <body>
@@ -1170,7 +1116,6 @@ tr.row-unused td:first-child { font-style: italic; }
   <div class="nav-tab" data-view="relationships">Relationships <span class="count" id="cRels">0</span></div>
   <div class="nav-tab" data-view="pages">Pages <span class="count" id="cPages">0</span></div>
   <div class="nav-tab" data-view="unused">Unused <span class="count" id="cUnused">0</span></div>
-  <div class="nav-tab" data-view="layout">Layout <span class="count" id="cLayout">0</span></div>
   <div class="nav-tab" data-view="notes">Notes</div>
   <div class="nav-tab" data-view="export">Export</div>
 </nav>
@@ -1200,7 +1145,6 @@ tr.row-unused td:first-child { font-style: italic; }
   <div class="view" id="view-relationships" style="padding:0"><div id="relationshipsContent" style="height:100%"></div></div>
   <div class="view" id="view-pages" style="padding:0"><div id="pagesContent" style="height:100%"></div></div>
   <div class="view" id="view-unused"><div class="view-inner" id="unusedContent"></div></div>
-  <div class="view" id="view-layout" style="padding:0"><div id="layoutContent" style="height:100%"></div></div>
   <div class="view" id="view-notes"><div class="view-inner" id="notesContent"></div></div>
   <div class="view" id="view-export"><div class="view-inner" id="exportContent"></div></div>
 
@@ -1232,10 +1176,6 @@ const App = {
     roles: [],            // [{name, modelPermission, tablePermissions:[{table, dax}]}] from roles/*.tmdl
     perspectives: [],     // [{name, members:[{kind, table, name}]}] from perspectives/*.tmdl
     functions: [],        // [{name, dax}] DAX user-defined functions from functions.tmdl
-    bookmarks: [],        // normalised bookmarks (both formats) — drives the Layout tab
-    layoutPage: null,     // page name shown in the Layout tab
-    layoutBookmark: '',   // '' = default state, else a bookmark name
-    layoutShowHidden: true,  // draw hidden visuals as ghosts?
     reportMeasures: [],   // report-level measures from PBIR reportExtensions.json
     activeView: 'overview',
     activeTable: null,
@@ -2506,30 +2446,12 @@ function parseReport(text) {
       const width = Math.round(vc.width ?? layoutPos.width ?? 0);
       const height = Math.round(vc.height ?? layoutPos.height ?? 0);
       const tabOrder = layoutPos.tabOrder ?? null;
-      // Default visibility in the legacy format lives on the visual's own config, as
-      // singleVisual.display.mode === 'hidden' (this is how PBI-Inspector counts visible
-      // visuals). The PBIR equivalent is the boolean visual.isHidden.
-      const isHidden = ((singleVisual.display || {}).mode || '') === 'hidden';
-      return {
-        type, fields, x, y, z, width, height, tabOrder,
-        id: cfg.name || '',
-        isHidden,
-        title: legacyVisualTitle(singleVisual),
-        parentGroup: cfg.parentGroupName || '',
-        isGroup: !!cfg.visualGroup,
-        groupMode: (cfg.visualGroup && cfg.visualGroup.groupMode) || '',
-      };
+      return { type, fields, x, y, z, width, height, tabOrder };
     });
-    // Legacy encodes page kind numerically: config.visibility === 1 means hidden in view
-    // mode, and config.type 1/2 marks tooltip / drillthrough pages.
-    const vis = sectionCfg.visibility;
-    const secType = sectionCfg.type;
     return {
       name: s.name || '',
       displayName: s.displayName || s.name || 'Unnamed',
       width: pageW, height: pageH,
-      hidden: vis === 1,
-      kind: secType === 1 ? 'Tooltip' : secType === 2 ? 'Drillthrough' : '',
       visuals,
     };
   });
@@ -2616,11 +2538,6 @@ async function parsePbirReport(byPath, pagesRoot) {
       displayName: pageJson.displayName || pageJson.name || pageName,
       width: Math.round(pageJson.width || 0),
       height: Math.round(pageJson.height || 0),
-      // A tooltip or drillthrough page isn't a page users navigate to, and a page hidden
-      // in view mode won't appear in the tab strip — both are worth distinguishing from
-      // an ordinary page rather than silently inflating the page count.
-      hidden: pageJson.visibility === 'HiddenInViewMode',
-      kind: pageJson.type || (pageJson.pageBinding && pageJson.pageBinding.type) || '',
       visuals,
     });
   }));
@@ -2678,154 +2595,10 @@ async function parsePbirReport(byPath, pagesRoot) {
     for (const r of columns) references.add(r);
     for (const r of measures) references.add(r);
   }
-  const bookmarks = await parsePbirBookmarks(byPath, definitionRoot);
-  return { pages, references, reportMeasures, bookmarks };
-}
-
-/* Normalise one bookmark (either format — the explorationState shape is shared) into:
-     { name, displayName, sectionName, suppressDisplay, applyOnlyToTargets,
-       targets:Set, states:{visualId: mode}, groupStates:{groupId: isHidden}, recordsDisplay }
-
-   `states` maps a visual id to its captured display mode — "hidden", "maximize",
-   "spotlight" or "elevation". A visual captured WITHOUT a display block is shown.
-
-   recordsDisplay is the honest flag that matters: many real bookmarks capture no display
-   state at all (they exist to change filters, or were saved with Display unchecked, which
-   sets suppressDisplay). For those we cannot know what was shown, and the UI must say so
-   instead of rendering a confidently wrong layout. */
-function normaliseBookmark(b) {
-  if (!b || typeof b !== 'object') return null;
-  const es = b.explorationState || {};
-  const opts = b.options || {};
-  const sections = es.sections || {};
-  // A bookmark captures one page; take the active section, else the only section present.
-  const sectionName = es.activeSection || Object.keys(sections)[0] || '';
-  const sec = sections[sectionName] || {};
-
-  const states = {};
-  let recordsDisplay = false;
-  for (const [vid, st] of Object.entries(sec.visualContainers || {})) {
-    const mode = st && st.singleVisual && st.singleVisual.display && st.singleVisual.display.mode;
-    if (typeof mode === 'string') { states[vid] = mode; recordsDisplay = true; }
-    else states[vid] = 'visible';   // captured, no display override → shown
-  }
-  // Groups are tracked separately; the schema notes visualContainers "does not include
-  // state of groups".
-  const groupStates = {};
-  for (const [gid, gs] of Object.entries(sec.visualContainerGroups || {})) {
-    if (gs && typeof gs.isHidden === 'boolean') { groupStates[gid] = gs.isHidden; recordsDisplay = true; }
-  }
-
-  return {
-    name: b.name || '',
-    displayName: b.displayName || b.name || 'Bookmark',
-    sectionName,
-    suppressDisplay: !!opts.suppressDisplay,
-    applyOnlyToTargets: !!opts.applyOnlyToTargetVisuals,
-    targets: new Set(opts.targetVisualNames || []),
-    states, groupStates,
-    capturedCount: Object.keys(sec.visualContainers || {}).length,
-    recordsDisplay: recordsDisplay && !opts.suppressDisplay,
-  };
-}
-
-/* PBIR: definition/bookmarks/*.bookmark.json, ordered by bookmarks.json when present. */
-async function parsePbirBookmarks(byPath, definitionRoot) {
-  const dir = `${definitionRoot}/bookmarks/`;
-  const keys = Object.keys(byPath).filter(k => k.startsWith(dir) && k.endsWith('.json') && !k.endsWith('/bookmarks.json'));
-  if (!keys.length) return [];
-  const texts = await Promise.all(keys.map(k => byPath[k].text().catch(() => null)));
-  const out = [];
-  for (const t of texts) {
-    if (t == null) continue;
-    try { const n = normaliseBookmark(JSON.parse(t)); if (n) out.push(n); } catch (e) {}
-  }
-  // bookmarks.json carries the author's ordering (and groups); honour it when available.
-  try {
-    const meta = JSON.parse(await byPath[`${dir}bookmarks.json`].text());
-    const order = [];
-    const walk = (items) => { for (const it of (items || [])) { if (it.name) order.push(it.name); walk(it.children); } };
-    walk(meta.items);
-    if (order.length) out.sort((a, b) => {
-      const ia = order.indexOf(a.name), ib = order.indexOf(b.name);
-      return (ia < 0 ? 1e9 : ia) - (ib < 0 ? 1e9 : ib);
-    });
-  } catch (e) {}
-  return out;
-}
-
-/* Legacy: bookmarks live inside report.json's stringified `config` blob. Confirmed against
-   microsoft/Analysis-Services SamplePBIP, whose report.config.bookmarks[] uses the same
-   explorationState shape as PBIR. */
-function parseLegacyBookmarks(reportText) {
-  try {
-    const r = JSON.parse(reportText);
-    const cfg = typeof r.config === 'string' ? JSON.parse(r.config) : (r.config || {});
-    return (cfg.bookmarks || []).map(normaliseBookmark).filter(Boolean);
-  } catch (e) { return []; }
-}
-
-/* Resolve which visuals are visible on `page` under `bookmark` (null = default state).
-   Returns a Map of visualId → true/false. Default visibility comes from the visual itself;
-   a bookmark can override it, subject to its scoping options. */
-function resolveVisibility(page, bookmark) {
-  const vis = new Map();
-  for (const v of page.visuals) vis.set(v.id, !v.isHidden);
-  if (!bookmark || !bookmark.recordsDisplay) return vis;
-  for (const v of page.visuals) {
-    // A targeted bookmark only touches the visuals it names; everything else keeps its
-    // default state.
-    if (bookmark.applyOnlyToTargets && !bookmark.targets.has(v.id)) continue;
-    const mode = v.isGroup ? undefined : bookmark.states[v.id];
-    if (v.isGroup && Object.prototype.hasOwnProperty.call(bookmark.groupStates, v.id)) {
-      vis.set(v.id, !bookmark.groupStates[v.id]);
-    } else if (typeof mode === 'string') {
-      vis.set(v.id, mode !== 'hidden');
-    }
-  }
-  return vis;
+  return { pages, references, reportMeasures };
 }
 
 /* Parse a single PBIR visual.json into the same shape parseReport's visuals use. */
-/* ═══════════════════════════════════════════════════════════════
-   LAYOUT / WIREFRAME SUPPORT
-   ═══════════════════════════════════════════════════════════════
-   Everything below feeds the Layout tab: per-visual identity and default visibility,
-   display titles, group membership, and per-bookmark show/hide state. It is additive —
-   existing parsers gain fields, none change shape. */
-
-/* Formatting values are wrapped as { expr: { Literal: { Value: "'text'" } } }. Power BI
-   stores string literals with embedded single quotes, so peel those too. Returns '' for
-   anything driven by a measure or conditional-formatting rule rather than a constant. */
-function literalValue(node) {
-  if (!node || typeof node !== 'object') return '';
-  const lit = node.expr && node.expr.Literal && node.expr.Literal.Value;
-  if (typeof lit !== 'string') return '';
-  return lit.replace(/^'(.*)'$/s, '$1');
-}
-/* Formatting objects are arrays of { properties: {...} } — pull one property's literal. */
-function formatObjectText(objArray, prop) {
-  if (!Array.isArray(objArray)) return '';
-  for (const entry of objArray) {
-    const v = entry && entry.properties && entry.properties[prop];
-    const text = literalValue(v);
-    if (text) return text;
-  }
-  return '';
-}
-
-/* The visual's own title, when it's a constant. Falls back to '' so callers show the type. */
-function pbirVisualTitle(visual) {
-  const vco = visual.visualContainerObjects || {};
-  return formatObjectText(vco.title, 'text');
-}
-function legacyVisualTitle(singleVisual) {
-  const vc = singleVisual.vcObjects || {};
-  let t = formatObjectText(vc.title, 'text');
-  if (!t) t = formatObjectText((singleVisual.objects || {}).general, 'altText');
-  return t;
-}
-
 function parsePbirVisual(vJson) {
   const visual = (vJson && vJson.visual) || {};
   const type = visual.visualType || 'unknown';
@@ -2850,22 +2623,7 @@ function parsePbirVisual(vJson) {
     }
   }
 
-  // Group containers declare `visualGroup` instead of `visual`; children point at them
-  // via parentGroupName. Coordinates are absolute to the PAGE for both (the schema's
-  // VisualContainerPosition is one shared definition describing x as "between 0 and width
-  // of the containing page"), so no offset maths is needed — but groupMode matters, since
-  // ScaleMode scales children at render time and ScrollMode can clip them.
-  const group = (vJson && vJson.visualGroup) || null;
-
-  return {
-    type, fields, x, y, z, width, height, tabOrder,
-    id: (vJson && vJson.name) || '',
-    isHidden: !!(vJson && vJson.isHidden),
-    title: group ? (group.displayName || '') : pbirVisualTitle(visual),
-    parentGroup: (vJson && vJson.parentGroupName) || '',
-    isGroup: !!group,
-    groupMode: group ? (group.groupMode || '') : '',
-  };
+  return { type, fields, x, y, z, width, height, tabOrder };
 }
 
 /* Fallback: derive a "Entity.Property" string from a QueryExpressionContainer when the
@@ -3499,22 +3257,19 @@ async function processFiles(fileList) {
   const legacyKey = Object.keys(byPath).find(k => /\.Report\/report\.json$/.test(k));
   if (pbirPagesRoot) {
     setLoadingText('Parsing report pages…');
-    const { pages, references, reportMeasures, bookmarks } = await parsePbirReport(byPath, pbirPagesRoot);
+    const { pages, references, reportMeasures } = await parsePbirReport(byPath, pbirPagesRoot);
     App.state.pages = pages;
     App.state.reportReferences = references;
     App.state.reportMeasures = reportMeasures || [];
-    App.state.bookmarks = bookmarks || [];
   } else if (legacyKey) {
     const text = await byPath[legacyKey].text();
     App.state.pages = parseReport(text);
     App.state.reportReferences = extractAllReportReferences(text);
     App.state.reportMeasures = [];
-    App.state.bookmarks = parseLegacyBookmarks(text);
   } else {
     App.state.pages = [];
     App.state.reportReferences = new Set();
     App.state.reportMeasures = [];
-    App.state.bookmarks = [];
   }
 
   // Roles and perspectives also reference model objects, and nothing else in the project
@@ -3569,7 +3324,6 @@ function updateCounts() {
   App.els.cRels.textContent = visRels.length;
   App.els.cPages.textContent = App.state.pages.length;
   if (App.els.cUnused) App.els.cUnused.textContent = countUnused();
-  if (App.els.cLayout) App.els.cLayout.textContent = App.state.bookmarks.length || App.state.pages.length;
   // Update the hidden-tables toggle label
   if (App.els.hiddenToggleLabel) {
     const total = countHiddenTables();
@@ -4849,131 +4603,6 @@ function renderUnusedSection(title, bucket, kind, isStructural) {
    Update this when you add a new feature or fix an edge case so
    future-you knows what the parser actually handles.
    ═══════════════════════════════════════════════════════════════ */
-/* ═══════════════════════════════════════════════════════════════
-   LAYOUT TAB — page wireframes
-   ═══════════════════════════════════════════════════════════════
-   Draws each page's visuals as boxes at their true canvas coordinates. Deliberately a
-   BLUEPRINT, not a mock of the report: flat outlines, no colour mimicry. PBIP carries no
-   data, so a faithful render is impossible — aiming at "schematic" means gaps read as
-   abstraction rather than as rendering bugs. */
-function renderLayout() {
-  const c = App.els.layoutContent;
-  if (!c) return;
-  const pages = App.state.pages || [];
-  if (!pages.length) {
-    c.innerHTML = '<div class="view-inner" style="color:var(--text-3)">No report pages found in this project.</div>';
-    return;
-  }
-  if (!App.state.layoutPage || !pages.find(p => p.name === App.state.layoutPage)) {
-    App.state.layoutPage = pages[0].name;
-  }
-  const page = pages.find(p => p.name === App.state.layoutPage);
-
-  // Only bookmarks that target this page are selectable here.
-  const bookmarks = (App.state.bookmarks || []).filter(b => !b.sectionName || b.sectionName === page.name);
-  const active = bookmarks.find(b => b.name === App.state.layoutBookmark) || null;
-
-  c.innerHTML = `
-    <div class="pages-layout">
-      <div class="pages-list" id="layoutRail">
-        ${pages.map(p => `
-          <div class="pages-list-item ${p.name === page.name ? 'active' : ''}" data-page="${esc(p.name)}">
-            <div class="pages-list-name">${esc(p.displayName)}</div>
-            <div class="pages-list-meta">
-              <span class="v">${p.visuals.length}</span> visual${p.visuals.length !== 1 ? 's' : ''}
-              ${p.kind ? ` · <span class="layout-flag">${esc(p.kind)}</span>` : ''}
-              ${p.hidden ? ' · <span class="layout-flag">hidden</span>' : ''}
-            </div>
-          </div>`).join('')}
-      </div>
-      <div class="page-detail" id="layoutDetail" style="padding:0;display:flex;flex-direction:column"></div>
-    </div>`;
-
-  c.querySelectorAll('.pages-list-item').forEach(el => {
-    el.onclick = () => { App.state.layoutPage = el.dataset.page; App.state.layoutBookmark = ''; renderLayout(); };
-  });
-  drawPageWireframe(c.querySelector('#layoutDetail'), page, bookmarks, active);
-}
-
-function drawPageWireframe(root, page, bookmarks, active) {
-  const pw = page.width || 1280, ph = page.height || 720;
-  const visible = resolveVisibility(page, active);
-  const shown = page.visuals.filter(v => visible.get(v.id) !== false);
-  const hiddenOnes = page.visuals.filter(v => visible.get(v.id) === false);
-  const showGhosts = App.state.layoutShowHidden;
-
-  // Anything the files can't tell us has to be said out loud rather than guessed.
-  const notes = [];
-  if (active && !active.recordsDisplay) {
-    notes.push(active.suppressDisplay
-      ? `<strong>“${esc(active.displayName)}” was saved with Display turned off</strong>, so it records no show/hide state. Showing the page's default layout instead.`
-      : `<strong>“${esc(active.displayName)}” records no visual show/hide state</strong> — it likely only changes filters or the filter pane. Showing the page's default layout instead.`);
-  }
-  if (page.visuals.some(v => v.isGroup)) {
-    notes.push('This page uses <strong>visual groups</strong>. Child coordinates are absolute to the page, but a group in <code>ScaleMode</code> scales its children at render time and <code>ScrollMode</code> can clip them — so grouped visuals may sit differently in the real report.');
-  }
-  if (page.visuals.some(v => !v.id)) {
-    notes.push('Some visuals have no id in the file, so bookmark states can\'t be matched to them.');
-  }
-
-  root.innerHTML = `
-    <div class="layout-toolbar">
-      <span class="source-type-badge other">page</span>
-      <strong style="font-size:15px">${esc(page.displayName)}</strong>
-      <span style="font-family:var(--mono);font-size:12px;color:var(--text-3)">${pw}×${ph}</span>
-      ${page.kind ? `<span class="layout-flag">${esc(page.kind)}</span>` : ''}
-      ${page.hidden ? '<span class="layout-flag">hidden page</span>' : ''}
-      <span style="flex:1"></span>
-      ${bookmarks.length ? `
-        <label style="font-size:12px;color:var(--text-2)">State
-          <select id="layoutBm" style="margin-left:6px;font-family:inherit;font-size:12px;padding:3px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg-2);color:var(--text)">
-            <option value="">Default (as saved)</option>
-            ${bookmarks.map(b => `<option value="${esc(b.name)}" ${active && active.name === b.name ? 'selected' : ''}>${esc(b.displayName)}${b.recordsDisplay ? '' : ' — no show/hide data'}</option>`).join('')}
-          </select>
-        </label>` : '<span style="font-size:12px;color:var(--text-3)">no bookmarks</span>'}
-      <label style="font-size:12px;color:var(--text-2);display:flex;align-items:center;gap:5px;cursor:pointer">
-        <input type="checkbox" id="layoutGhosts" ${showGhosts ? 'checked' : ''} style="margin:0;cursor:pointer">
-        Show hidden (${hiddenOnes.length})
-      </label>
-    </div>
-
-    ${notes.map(n => `<div class="layout-note">${n}</div>`).join('')}
-
-    <div class="layout-canvas-wrap">
-      <div class="layout-canvas" id="layoutCanvas" style="aspect-ratio:${pw} / ${ph}">
-        ${page.visuals
-          .slice()
-          .sort((a, b) => (a.z || 0) - (b.z || 0))   // z is an arbitrary number, not an index — sort, never index
-          .filter(v => visible.get(v.id) !== false || showGhosts)
-          .map(v => {
-            const isOff = visible.get(v.id) === false;
-            const L = (v.x / pw) * 100, T = (v.y / ph) * 100;
-            const W = (v.width / pw) * 100, H = (v.height / ph) * 100;
-            const label = v.title || v.type;
-            const fieldList = v.fields.map(f => f.ref).join(', ');
-            return `<div class="wf-box ${isOff ? 'wf-hidden' : ''} ${v.isGroup ? 'wf-group' : ''}"
-                 style="left:${L}%;top:${T}%;width:${W}%;height:${H}%"
-                 title="${esc(label)}&#10;${esc(v.type)}${v.isGroup ? ' (group' + (v.groupMode ? ', ' + v.groupMode : '') + ')' : ''}&#10;${v.x},${v.y} · ${v.width}×${v.height} · z=${v.z}${fieldList ? '&#10;&#10;' + esc(fieldList) : ''}${isOff ? '&#10;&#10;hidden in this state' : ''}">
-              <span class="wf-label">${esc(label)}</span>
-              ${v.fields.length ? `<span class="wf-fields">${esc(fieldList)}</span>` : ''}
-            </div>`;
-          }).join('')}
-      </div>
-    </div>
-
-    <div class="layout-legend">
-      <span><span class="lg-swatch"></span> visible (${shown.length})</span>
-      <span><span class="lg-swatch lg-hidden"></span> hidden (${hiddenOnes.length})</span>
-      <span><span class="lg-swatch lg-group"></span> group</span>
-      <span style="color:var(--text-3)">Blueprint only — PBIP holds no data, so contents aren't rendered.</span>
-    </div>`;
-
-  const sel = root.querySelector('#layoutBm');
-  if (sel) sel.onchange = () => { App.state.layoutBookmark = sel.value; renderLayout(); };
-  const gh = root.querySelector('#layoutGhosts');
-  if (gh) gh.onchange = () => { App.state.layoutShowHidden = gh.checked; renderLayout(); };
-}
-
 function renderNotes() {
   const c = App.els.notesContent;
   c.innerHTML = `
@@ -5966,7 +5595,6 @@ function renderActive() {
   else if (v === 'relationships') renderRelationships();
   else if (v === 'pages') renderPages();
   else if (v === 'unused') renderUnused();
-  else if (v === 'layout') renderLayout();
   else if (v === 'notes') renderNotes();
   else if (v === 'export') renderExport();
 }
@@ -6294,8 +5922,6 @@ function init() {
   App.els.relationshipsContent = document.getElementById('relationshipsContent');
   App.els.pagesContent = document.getElementById('pagesContent');
   App.els.unusedContent = document.getElementById('unusedContent');
-  App.els.layoutContent = document.getElementById('layoutContent');
-  App.els.cLayout = document.getElementById('cLayout');
   App.els.notesContent = document.getElementById('notesContent');
   App.els.exportContent = document.getElementById('exportContent');
   App.els.cSources = document.getElementById('cSources');
