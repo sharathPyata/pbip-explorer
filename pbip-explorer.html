@@ -1172,6 +1172,9 @@ const App = {
     sources: [],          // [{key, name, type, server, description, queries:[tableName]}]
     pages: [],            // [{name, displayName, visuals:[{type, fields:[]}]}]
     modelAnnotations: {}, // raw annotations from model.tmdl
+    roles: [],            // [{name, modelPermission, tablePermissions:[{table, dax}]}] from roles/*.tmdl
+    perspectives: [],     // [{name, members:[{kind, table, name}]}] from perspectives/*.tmdl
+    reportMeasures: [],   // report-level measures from PBIR reportExtensions.json
     activeView: 'overview',
     activeTable: null,
     activePage: null,
@@ -1626,6 +1629,48 @@ function parseTable(text) {
 /* TMDL annotation values aren't normalized: Power BI writes booleans as `= 1` in
    some places and `= true` in others (and a quoted "true" turns up too). Test for
    truthiness rather than one literal. */
+/* Split a TMDL document into one chunk per top-level `table` declaration.
+   Child objects are tab-indented and multi-line expressions are indented deeper still, so a
+   line matching /^table\s/ at column 0 is an unambiguous table boundary. A `///` description
+   block belongs to the declaration that follows it, so leading comment lines are carried into
+   the next chunk rather than left on the previous one. */
+function splitTableDocuments(text) {
+  const lines = (text || '').split('\n');
+  const starts = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (!/^table\s/.test(lines[i])) continue;
+    // Walk back over the contiguous `///` description block above this declaration.
+    let j = i;
+    while (j > 0 && /^\s*\/\/\//.test(lines[j - 1])) j--;
+    starts.push(j);
+  }
+  if (starts.length <= 1) return [text];
+  const docs = [];
+  for (let k = 0; k < starts.length; k++) {
+    const end = k + 1 < starts.length ? starts[k + 1] : lines.length;
+    docs.push(lines.slice(starts[k], end).join('\n'));
+  }
+  return docs;
+}
+
+/* Fold a partial declaration of an already-seen table into the first one. Members are
+   concatenated; scalar properties only fill in where the first declaration left a blank,
+   so the document that actually carried the table's definition wins. */
+function mergeTableInto(target, extra) {
+  for (const key of ['columns', 'measures', 'hierarchies', 'calcItems']) {
+    if (!Array.isArray(extra[key]) || !extra[key].length) continue;
+    if (!Array.isArray(target[key])) target[key] = [];
+    const seen = new Set(target[key].map(o => o && o.name));
+    for (const item of extra[key]) if (!item || !seen.has(item.name)) target[key].push(item);
+  }
+  for (const key of ['description', 'partitionSource', 'partitionKind', 'mode']) {
+    if (!target[key] && extra[key]) target[key] = extra[key];
+  }
+  if (extra.annotations) target.annotations = { ...(extra.annotations), ...(target.annotations || {}) };
+  if (extra.isHidden) target.isHidden = true;
+  return target;
+}
+
 function annIsTrue(v) {
   if (v == null) return false;
   const s = String(v).trim().toLowerCase().replace(/^"(.*)"$/, '$1');
@@ -1945,13 +1990,17 @@ function detectSource(mCode, expressions, tablesList, visited) {
   //    direct-connector detection in step 3 below.
   const localSteps = parseMSteps(mCode);
   const shadowed = new Set(localSteps ? localSteps.steps.map(st => st.name) : []);
+  let viaUnknown = null;
   for (const ename of Object.keys(expressions)) {
     if (shadowed.has(ename)) continue;
     const re = new RegExp(`#"${escRe(ename)}"|(?<![A-Za-z0-9_])${escRe(ename)}(?![A-Za-z0-9_])`);
     if (re.test(mCode)) {
-      const info = fromM(expressions[ename].sourceM);
+      const info = fromM(inlineMParameters(expressions[ename].sourceM, expressions));
       info.viaExpression = ename;
-      return info;
+      // Only let the expression win if it actually resolved. A shared expression that
+      // fromM can't recognise shouldn't pre-empt a connector this query names directly.
+      if (info.key !== 'unknown') return info;
+      viaUnknown = viaUnknown || info;
     }
   }
 
@@ -1961,7 +2010,7 @@ function detectSource(mCode, expressions, tablesList, visited) {
   }
 
   // 3. Direct connector (Snowflake, SQL, Dataverse, etc.)
-  const direct = fromM(mCode);
+  const direct = fromM(inlineMParameters(mCode, expressions));
   if (direct.key !== 'unknown') return direct;
 
   // 4. References another model TABLE? Recursively resolve to that table's ultimate source
@@ -1985,7 +2034,7 @@ function detectSource(mCode, expressions, tablesList, visited) {
   if (/#table\s*\(|Table\.FromValue\s*\(|List\.(?:Numbers|Dates|Generate)\s*\(/.test(mCode)) {
     return { key: 'computed', name: 'Computed', type: 'other', server: 'No external source' };
   }
-  return { key: 'unknown', name: 'Unknown', type: 'other', server: '' };
+  return viaUnknown || { key: 'unknown', name: 'Unknown', type: 'other', server: '' };
 }
 
 /* Collapse different expressions/tables that share the same underlying connection into one card. */
@@ -2067,6 +2116,40 @@ function stripMNoise(code, blankStrings) {
   }
   return out;
 }
+/* Substitute Power Query parameters that hold a plain string literal into `mCode`.
+
+   Every connector pattern in fromM() needs a double-quoted literal, but parameterising the
+   server and database — `Sql.Database(Server, Database)` with `expression Server = "host"` —
+   is Microsoft's own recommended practice for deployment pipelines, and it is what the TMDL
+   spec's own example shows. Unsubstituted, every such model reported its connections as
+   "Unknown" and collapsed them into a single meaningless source card. Two passes so a
+   parameter defined in terms of another still resolves. */
+/* A Power Query *parameter* is a shared expression whose whole body is one string literal,
+   optionally carrying a `meta [IsParameterQuery=true, ...]` record. Returns the literal, or
+   null if this expression is a real query rather than a parameter. */
+function parameterLiteral(sourceM) {
+  const m = String(sourceM || '').trim().match(/^"((?:[^"]|"")*)"\s*(?:meta\b[\s\S]*)?$/);
+  return m ? m[1].replace(/""/g, '"') : null;
+}
+
+function inlineMParameters(mCode, expressions) {
+  if (!mCode || !expressions) return mCode || '';
+  const params = {};
+  for (const [name, data] of Object.entries(expressions)) {
+    const lit = parameterLiteral(data && data.sourceM);
+    if (lit !== null) params[name] = lit;
+  }
+  if (!Object.keys(params).length) return mCode;
+  let out = mCode;
+  for (let pass = 0; pass < 2; pass++) {
+    for (const [name, value] of Object.entries(params)) {
+      const re = new RegExp(`#"${escRe(name)}"|(?<![A-Za-z0-9_."])${escRe(name)}(?![A-Za-z0-9_"])`, 'g');
+      out = out.replace(re, `"${value}"`);
+    }
+  }
+  return out;
+}
+
 function fromM(mCode, keyPrefix, nameOverride) {
   const patterns = [
     [/Sql\.Database\s*\(\s*"([^"]+)"\s*(?:,\s*"([^"]+)")?/, 'sql-server'],
@@ -2255,6 +2338,40 @@ async function parsePbirReport(byPath, pagesRoot) {
   pages.sort((a, b) => a._order - b._order);
   for (const p of pages) delete p._order;
 
+  // 3b. The report definition folder holds three more reference-bearing files that are NOT
+  //     under pages/, and missing them reported genuinely-used fields as unused:
+  //       report.json          — report-level filters
+  //       reportExtensions.json— report-level measures (DAX over model columns/measures)
+  //       bookmarks/*.json     — captured filter/slicer state
+  //     definitionRoot is pagesRoot minus the trailing "/pages".
+  const definitionRoot = pagesRoot.replace(/\/pages$/, '');
+  const extraKeys = Object.keys(byPath).filter(k =>
+    k === `${definitionRoot}/report.json` ||
+    k === `${definitionRoot}/reportExtensions.json` ||
+    (k.startsWith(`${definitionRoot}/bookmarks/`) && k.endsWith('.json')));
+  const extraTexts = await Promise.all(extraKeys.map(k => byPath[k].text().catch(() => null)));
+  const reportMeasures = [];
+  for (let i = 0; i < extraKeys.length; i++) {
+    if (extraTexts[i] == null) continue;
+    let j;
+    try { j = JSON.parse(extraTexts[i]); } catch (e) { continue; }
+    allJson.push(j);
+    // Report-level measures are real measures that live in the report, not the model. Their
+    // DAX is the only place some model columns are referenced, so mine it for references
+    // as well as surfacing the measures themselves.
+    if (extraKeys[i].endsWith('/reportExtensions.json')) {
+      for (const ent of (j.entities || [])) {
+        for (const meas of (ent.measures || [])) {
+          if (!meas || !meas.name) continue;
+          reportMeasures.push({
+            table: ent.name || '', name: meas.name, dax: meas.expression || '',
+            displayFolder: meas.displayFolder || '', formatString: meas.formatString || '',
+          });
+        }
+      }
+    }
+  }
+
   // 4. Run the report-references walker on EACH parsed file and union the results.
   //    Do NOT concatenate the file texts — multiple JSON documents joined together aren't
   //    valid JSON, so a single JSON.parse would fail and silently return zero references
@@ -2264,7 +2381,14 @@ async function parsePbirReport(byPath, pagesRoot) {
   for (const obj of allJson) {
     for (const r of extractAllReportReferences(obj)) references.add(r);
   }
-  return { pages, references };
+  // Report-level measure DAX references model objects by name, which the JSON walker above
+  // can't see — it's an expression string, not a structured binding.
+  for (const rm of reportMeasures) {
+    const { columns, measures } = parseDaxReferences(rm.dax);
+    for (const r of columns) references.add(r);
+    for (const r of measures) references.add(r);
+  }
+  return { pages, references, reportMeasures };
 }
 
 /* Parse a single PBIR visual.json into the same shape parseReport's visuals use. */
@@ -2328,6 +2452,91 @@ function pbirFieldToRef(field) {
 /* ═══════════════════════════════════════════════════════════════
    USAGE ANALYSIS
    ═══════════════════════════════════════════════════════════════ */
+/* roles/*.tmdl — each holds `role <name>` with `tablePermission <Table> = <DAX filter>`
+   and optional `columnPermission` entries. The filter DAX is the only reference to the
+   columns an RLS rule guards. */
+/* dataSources.tmdl — TMDL's root file for explicit DataSource objects. Models that Power BI
+   Desktop writes today express their connections as M inside partitions, but provider/legacy
+   models (and models migrated from Analysis Services) declare them here instead, where the
+   M-based detection in detectSource can never see them. Missing the file meant those sources
+   simply did not appear in the Sources tab or its count. */
+function parseDataSources(text) {
+  const out = [];
+  if (!text) return out;
+  for (const block of text.split(/\n(?=dataSource\s)/)) {
+    const m = block.match(/^dataSource\s+(.+?)\s*(?:=\s*(\w+))?\s*$/m);
+    if (!m) continue;
+    const conn = (block.match(/^\tconnectionString:\s*(.+)$/m) || [])[1] || '';
+    // Pull a host out of the connection string so these group like the M-detected sources do.
+    const server = (conn.match(/(?:Data Source|Server|Host)\s*=\s*([^;]+)/i) || [])[1] || '';
+    const db = (conn.match(/(?:Initial Catalog|Database)\s*=\s*([^;]+)/i) || [])[1] || '';
+    out.push({
+      name: unquote(m[1]), kind: m[2] || 'provider',
+      connectionString: conn.trim(), server: server.trim(), database: db.trim(),
+    });
+  }
+  return out;
+}
+
+async function parseRolesFolder(byPath, smRoot) {
+  const re = new RegExp(`^${escRe(smRoot)}/definition/roles/.+\\.tmdl$`);
+  const paths = Object.keys(byPath).filter(k => re.test(k));
+  if (!paths.length) return [];
+  const texts = (await Promise.all(paths.map(k => byPath[k].text().catch(() => '')))).map(normTmdl);
+  const roles = [];
+  for (const text of texts) {
+    const nameM = text.match(/^role\s+(.+?)\s*$/m);
+    if (!nameM) continue;
+    const role = {
+      name: unquote(nameM[1]),
+      modelPermission: (text.match(/^\tmodelPermission:\s*(\w+)/m) || [])[1] || '',
+      tablePermissions: [],
+    };
+    // `tablePermission <Table> = <DAX>` — single-line, or a multi-line body indented deeper.
+    const lines = text.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      const tp = lines[i].match(/^\ttablePermission\s+(.+?)\s*=\s*(.*)$/);
+      if (!tp) continue;
+      let dax = tp[2].trim();
+      if (!dax) {
+        const body = [];
+        let k = i + 1;
+        while (k < lines.length && (/^\t\t\t/.test(lines[k]) || !lines[k].trim())) { body.push(lines[k]); k++; }
+        dax = normalizeIndent(body.join('\n')).trim();
+      }
+      role.tablePermissions.push({ table: unquote(tp[1]), dax });
+    }
+    roles.push(role);
+  }
+  return roles;
+}
+
+/* perspectives/*.tmdl — nested perspectiveTable / perspectiveColumn / perspectiveMeasure /
+   perspectiveHierarchy declarations naming the objects the perspective exposes. */
+async function parsePerspectivesFolder(byPath, smRoot) {
+  const re = new RegExp(`^${escRe(smRoot)}/definition/perspectives/.+\\.tmdl$`);
+  const paths = Object.keys(byPath).filter(k => re.test(k));
+  if (!paths.length) return [];
+  const texts = (await Promise.all(paths.map(k => byPath[k].text().catch(() => '')))).map(normTmdl);
+  const out = [];
+  for (const text of texts) {
+    const nameM = text.match(/^perspective\s+(.+?)\s*$/m);
+    if (!nameM) continue;
+    const persp = { name: unquote(nameM[1]), members: [] };
+    let currentTable = '';
+    for (const ln of text.split('\n')) {
+      const t = ln.match(/^\tperspectiveTable\s+(.+?)\s*$/);
+      if (t) { currentTable = unquote(t[1]); continue; }
+      const m = ln.match(/^\t\tperspective(Column|Measure|Hierarchy)\s+(.+?)\s*$/);
+      if (m && currentTable) {
+        persp.members.push({ kind: m[1].toLowerCase(), table: currentTable, name: unquote(m[2]) });
+      }
+    }
+    out.push(persp);
+  }
+  return out;
+}
+
 function buildUsageIndex() {
   const byKey = {};
   for (const t of App.state.tables) {
@@ -2389,6 +2598,28 @@ function buildUsageIndex() {
         const k = `${t.name}.${colName}`;
         if (byKey[k]) byKey[k].structural.push('hierarchy level');
       }
+    }
+  }
+
+  // 4b. Direct — row-level-security filter DAX. A column an RLS rule filters on is load-
+  //     bearing in the strongest sense: drop it and the model stops securing rows. Counted
+  //     as a direct use, not structural, because there is nothing optional about it.
+  for (const role of (App.state.roles || [])) {
+    for (const tp of (role.tablePermissions || [])) {
+      const { columns, measures } = parseDaxReferences(tp.dax);
+      for (const k of [...columns, ...measures]) {
+        if (byKey[k]) byKey[k].direct.push(`RLS role "${role.name}"`);
+      }
+    }
+  }
+
+  // 4c. Structural — perspective membership. A perspective exposing a field is a deliberate
+  //     act of curation, but it doesn't by itself prove anything consumes the field, so this
+  //     is structural rather than direct.
+  for (const persp of (App.state.perspectives || [])) {
+    for (const mem of (persp.members || [])) {
+      const k = `${mem.table}.${mem.name}`;
+      if (byKey[k]) byKey[k].structural.push(`perspective "${persp.name}"`);
     }
   }
 
@@ -2602,7 +2833,14 @@ async function processFiles(fileList) {
   // Find a SemanticModel folder
   const smKey = Object.keys(byPath).find(k => /\.SemanticModel\/definition\/model\.tmdl$/.test(k));
   if (!smKey) {
-    showToast('No .SemanticModel/definition/model.tmdl found in the dropped folder', 'error');
+    // A semantic model can be saved in either of two formats, and this parser reads only
+    // TMDL. TMSL (a single model.bim) is what Desktop writes when the "Store semantic model
+    // using TMDL format" preview option is off, so it's a normal project, not a broken one —
+    // say which format was found rather than implying the folder is malformed.
+    const bimKey = Object.keys(byPath).find(k => /\.SemanticModel\/model\.bim$/.test(k));
+    showToast(bimKey
+      ? 'This project stores its model as TMSL (model.bim). PBIP Explorer currently reads only the TMDL format (definition/model.tmdl). In Power BI Desktop: Options > Preview features > "Store semantic model using TMDL format", then re-save.'
+      : 'No semantic model found — expected a .SemanticModel/definition/model.tmdl (TMDL) folder in the dropped project.', 'error');
     return;
   }
   const smRoot = smKey.replace(/\/definition\/model\.tmdl$/, '');
@@ -2638,8 +2876,19 @@ async function processFiles(fileList) {
   const tablePaths = Object.keys(byPath).filter(p => tablePathRe.test(p));
   const tableTexts = (await Promise.all(tablePaths.map(p => byPath[p].text()))).map(normTmdl);
   for (const text of tableTexts) {
-    const t = parseTable(text);
-    if (t) tables.push(t);
+    // One file does NOT imply one table. TMDL supports "partial declaration": a document
+    // may declare several tables, and a table's members may be split across documents
+    // (the spec's own example keeps every table's measures in one measures.tmdl). Power BI
+    // Desktop writes one table per file, but Tabular Editor and hand-edited/scripted models
+    // do use this. Parsing only the first `table` in a document silently merged the second
+    // table's columns and measures into the first and dropped the table itself — wrong table
+    // count, wrong column/measure counts, and its data source missing from the Sources tab.
+    for (const doc of splitTableDocuments(text)) {
+      const t = parseTable(doc);
+      if (!t) continue;
+      const existing = tables.find(x => x.name === t.name);
+      if (existing) mergeTableInto(existing, t); else tables.push(t);
+    }
   }
   tables.sort((a,b) => a.name.localeCompare(b.name));
   App.state.tables = tables;
@@ -2670,7 +2919,12 @@ async function processFiles(fileList) {
 
   // Pre-seed from shared expressions
   for (const [ename, edata] of Object.entries(App.state.expressions)) {
-    const info = fromM(edata.sourceM);
+    // A parameter (`expression Server = "host" meta [IsParameterQuery=true]`) is a scalar
+    // input to other queries, not a connection. Seeding one created a phantom "Unknown"
+    // source card holding no tables, inflating the source count on every model that
+    // parameterises its connections — which is most of them.
+    if (parameterLiteral(edata.sourceM) !== null) continue;
+    const info = fromM(inlineMParameters(edata.sourceM, App.state.expressions));
     const key = sourceGroupKey(info);
     const src = ensureSource(info, key);
     src.expressions.push({ name: ename, description: edata.description, m: edata.sourceM });
@@ -2693,6 +2947,18 @@ async function processFiles(fileList) {
     const src = ensureSource(info, key);
     src.queries.push(t.name);
   }
+  // Explicit DataSource objects (dataSources.tmdl) sit alongside the M-derived ones.
+  for (const ds of parseDataSources(await readText(`${smRoot}/definition/dataSources.tmdl`))) {
+    const info = {
+      key: `datasource:${(ds.server || ds.name).toLowerCase()}:${ds.database.toLowerCase()}`,
+      name: ds.database || ds.server || ds.name,
+      type: /sql/i.test(ds.connectionString) ? 'sql-server' : 'other',
+      server: ds.database ? `${ds.server} / ${ds.database}` : (ds.server || ds.connectionString),
+    };
+    const src = ensureSource(info, info.key);
+    src.declared = true;
+    src.expressions.push({ name: ds.name, description: `Declared data source (${ds.kind})`, m: ds.connectionString });
+  }
   App.state.sources = Object.values(sourcesByKey);
 
   // Parse report — detect PBIR (per-file) first; fall back to PBIR-Legacy (single report.json).
@@ -2707,17 +2973,28 @@ async function processFiles(fileList) {
   const legacyKey = Object.keys(byPath).find(k => /\.Report\/report\.json$/.test(k));
   if (pbirPagesRoot) {
     setLoadingText('Parsing report pages…');
-    const { pages, references } = await parsePbirReport(byPath, pbirPagesRoot);
+    const { pages, references, reportMeasures } = await parsePbirReport(byPath, pbirPagesRoot);
     App.state.pages = pages;
     App.state.reportReferences = references;
+    App.state.reportMeasures = reportMeasures || [];
   } else if (legacyKey) {
     const text = await byPath[legacyKey].text();
     App.state.pages = parseReport(text);
     App.state.reportReferences = extractAllReportReferences(text);
+    App.state.reportMeasures = [];
   } else {
     App.state.pages = [];
     App.state.reportReferences = new Set();
+    App.state.reportMeasures = [];
   }
+
+  // Roles and perspectives also reference model objects, and nothing else in the project
+  // does. A column used only by an RLS filter, or a measure exposed only through a
+  // perspective, was being reported as unused — a false positive that invites deleting
+  // something load-bearing. Both live in their own TMDL sub-folders.
+  setLoadingText('Parsing roles and perspectives…');
+  App.state.roles = await parseRolesFolder(byPath, smRoot);
+  App.state.perspectives = await parsePerspectivesFolder(byPath, smRoot);
 
   // Build usage index (needs tables + relationships + pages + reportReferences).
   // This is the heaviest synchronous step, so paint the overlay text first.
@@ -4294,13 +4571,18 @@ function renderNotes() {
         <tr><td>Relationships</td><td><code>relationships.tmdl</code> from/to columns</td><td>Structural</td></tr>
         <tr><td>sortByColumn</td><td>column property pointing at another column (quoted names are unquoted before lookup)</td><td>Structural</td></tr>
         <tr><td><strong>Hierarchy level</strong></td><td><code>level X { column: Y }</code> inside a <code>hierarchy</code> block — the referenced column is kept alive by the hierarchy</td><td>Structural</td></tr>
+        <tr><td><strong>Row-level security</strong></td><td><code>roles/*.tmdl</code> &rarr; <code>tablePermission T = &lt;DAX&gt;</code>. The filter DAX is parsed with the same reference extractor as measure DAX. Counted as <em>direct</em>, not structural: a column an RLS rule filters on is load-bearing — drop it and the model stops securing rows.</td><td>Direct</td></tr>
+        <tr><td><strong>Report-level measures</strong></td><td>PBIR <code>definition/reportExtensions.json</code> &rarr; <code>entities[].measures[].expression</code>. These measures live in the report, not the model, so their DAX is often the only reference to a model column.</td><td>Direct</td></tr>
+        <tr><td><strong>Report-level filters</strong></td><td>PBIR <code>definition/report.json</code> — walked by the same recursive extractor as pages and visuals</td><td>Direct</td></tr>
+        <tr><td><strong>Bookmarks</strong></td><td>PBIR <code>definition/bookmarks/*.bookmark.json</code> — a bookmark captures filter and slicer state, which can be the only place a field is referenced</td><td>Direct</td></tr>
+        <tr><td><strong>Perspective membership</strong></td><td><code>perspectives/*.tmdl</code> &rarr; <code>perspectiveColumn</code> / <code>perspectiveMeasure</code> / <code>perspectiveHierarchy</code>. Structural rather than direct: curation is deliberate, but doesn't prove anything consumes the field.</td><td>Structural</td></tr>
       </tbody>
     </table>
 
     <h3>9.2 Final classification</h3>
     <ul>
       <li><strong>Used</strong> — has any direct or transitive reference</li>
-      <li><strong>Structural only</strong> — only relationships / sortBy (kept hidden by default in the Unused tab — toggle to show)</li>
+      <li><strong>Structural only</strong> — only relationships / sortBy / hierarchy levels / perspective membership (kept hidden by default in the Unused tab — toggle to show)</li>
       <li><strong>Unused</strong> — nothing at all → flagged with a gray pill and listed in the Unused tab</li>
     </ul>
 

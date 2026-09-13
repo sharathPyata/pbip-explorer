@@ -117,6 +117,9 @@ PBIP Explorer reads the `.SemanticModel/definition/*.tmdl` files for the data mo
 | **TMDL** | Model annotations, tables, columns (data types, format strings, sort-by, lineage tags), measures (DAX, single-line / triple-backtick / indented), calculated columns, hierarchies, calculation groups (with precedence and items), partitions (Power Query M / calculated / calculation-group), table relationships |
 | **M (Power Query)** | Connector patterns, inline data (`Table.FromRecords`, `Table.FromRows`, base64+deflate-compressed inline data), SQL extracted from native queries, all M string escape sequences (`#(lf)`, `#(cr)`, `#(2605)`, etc.) |
 | **Report JSON** | Pages, visuals, field bindings (`queryRef`, structured `Column` / `Measure` / `Hierarchy` / `HierarchyLevel` refs), visual positions and z-order, filter references, conditional formatting refs |
+| **Report extras (PBIR)** | `report.json` report-level filters, `reportExtensions.json` report-level measures (name, DAX, table), `bookmarks/*.bookmark.json` captured filter state |
+| **Security & curation** | `roles/*.tmdl` RLS roles (`modelPermission`, `tablePermission` filter DAX), `perspectives/*.tmdl` membership |
+| **Declared sources** | `dataSources.tmdl` explicit provider data sources, with host/database pulled from the connection string |
 
 ---
 
@@ -143,8 +146,8 @@ Multiple expressions pointing to the same host collapse into one source card.
 
 The **Unused** tab classifies each column / measure into:
 
-- **Used** — referenced by a visual binding, filter, DAX expression, or M code of a used table
-- **Structural only** — referenced only by relationships, `sortByColumn`, or hierarchy levels (usually safe to keep)
+- **Used** — referenced by a visual binding, filter, DAX expression, or M code of a used table; by a **row-level-security filter**; by a **report-level measure**; or by a **bookmark's** captured state
+- **Structural only** — referenced only by relationships, `sortByColumn`, hierarchy levels, or **perspective membership** (usually safe to keep)
 - **Unused** — no references anywhere
 
 Detection is regex-based and errs on the safe side: if a column name appears in an unrelated string literal, it'll be counted as used.
@@ -171,6 +174,9 @@ This means you can drop a PBIP that contains internal SQL, schema names, or sens
 ---
 
 ## Known limitations
+
+- **TMSL (`model.bim`) models aren't read** — only the TMDL format (`definition/model.tmdl`) is. TMDL is still a preview option in Power BI Desktop (*Options > Preview features > "Store semantic model using TMDL format"*), so a project saved without it won't load; the app says so explicitly rather than claiming the folder is malformed.
+- **`functions.tmdl` (DAX user-defined functions) and `cultures/*.tmdl` aren't parsed**, so objects referenced only from a UDF body or a linguistic schema can still show as unused.
 
 - **Multi-line calculated-column DAX** (backtick-fenced or indented) is only partially captured — single-line definitions are fully read.
 - **KPI definitions, detail-rows expressions, formatStringDefinition DAX** are present in the model but not parsed for entity references.
