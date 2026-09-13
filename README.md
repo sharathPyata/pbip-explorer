@@ -105,6 +105,7 @@ PBIP Explorer reads **both** semantic-model formats. TMDL (`.SemanticModel/defin
 | **Relationships** | Force-directed graph. Pan, zoom, drag, hover-to-highlight; arrow markers; dashed lines for bidirectional cross-filter |
 | **Pages** | Master/detail like Tables. "📑 All Pages" shows the stacked list of every page; selecting a specific page shows just that page's visuals. A search box at the top filters by field or measure name (e.g. `Sales.Amount`, `Profit`) and highlights matches inline |
 | **Unused** | Columns and measures with no references in visuals, filters, DAX, or M code. Toggle to also show "structural-only" items (referenced only by relationships / sortBy / hierarchies) |
+| **Theme** | The report's effective theme — base + custom merged — with data-colour and semantic-colour swatches and the text classes (font, size, colour) behind each. Plus a styling audit: every visual that sets a colour or font itself, split into **hardcoded** values (which won't follow a theme change) and theme references |
 | **Notes** | Self-documenting reference describing exactly what the parser supports. Open even without loading a folder to read it |
 | **Export** | Generates a single Markdown document of the whole model — paste it into an AI chat as context, share it, or copy all measures at once. Section toggles + presets (Everything / Measures only / Schema only / AI prompt), with copy-to-clipboard and download-`.md` buttons |
 
@@ -122,6 +123,7 @@ PBIP Explorer reads **both** semantic-model formats. TMDL (`.SemanticModel/defin
 | **Security & curation** | `roles/*.tmdl` RLS roles (`modelPermission`, `tablePermission` filter DAX), `perspectives/*.tmdl` membership |
 | **DAX functions** | `functions.tmdl` user-defined functions — the body's column/measure references count as usage |
 | **Declared sources** | `dataSources.tmdl` explicit provider data sources, with host/database pulled from the connection string |
+| **Themes** | `StaticResources/SharedResources/BaseThemes/*.json` and `RegisteredResources/*.json`, resolved via `themeCollection`. Custom overrides base key-by-key. Per-visual `ThemeDataColor` references are resolved against the palette, including the tint/shade `Percent` |
 
 ---
 
@@ -177,6 +179,7 @@ This means you can drop a PBIP that contains internal SQL, schema names, or sens
 
 ## Known limitations
 
+- **The Theme tab shows the palette available, not the colours on screen.** A chart without overrides takes theme colours by *series index*, and the number of series depends on the data — which a PBIP doesn't contain. Conditional formatting is value-driven for the same reason. Explicit per-visual colours and fonts are reported exactly; the rendered result can't be.
 - **`cultures/*.tmdl` (Q&A linguistic schema) is deliberately not counted as usage.** Power BI auto-generates a synonym entity for every table and every column, so treating the linguistic schema as a reference would mark the entire model "used" and render the Unused tab meaningless. This is an intentional exclusion, not a gap.
 - **Multi-line calculated-column DAX** in the backtick-fenced form is fully read; the indented form is read for the common cases.
 

@@ -1086,6 +1086,32 @@ tr.row-unused td:first-child { font-style: italic; }
 .toast.error { border-color: var(--red); }
 .toast.success { border-color: var(--green); }
 @keyframes toastIn { from { opacity: 0; transform: translate(-50%, 12px); } to { opacity: 1; transform: translate(-50%, 0); } }
+
+/* ── Theme tab ─────────────────────────────────────────────────────────────── */
+.th-k { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: var(--text-3); }
+.th-v { font-weight: 600; font-size: 14px; color: var(--text); margin-top: 2px; }
+.th-f { font-family: var(--mono); font-size: 11px; color: var(--text-3); }
+.th-note { margin-top: 12px; font-size: 12px; line-height: 1.55; color: var(--text-2); }
+.sw-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+.sw { display: flex; align-items: center; gap: 9px; }
+.sw-chip {
+  width: 30px; height: 30px; flex-shrink: 0; border-radius: 4px;
+  border: 1px solid rgba(0,0,0,.18); box-shadow: inset 0 0 0 1px rgba(255,255,255,.25);
+}
+.sw-label { font-size: 12px; color: var(--text); font-weight: 500; }
+.sw-hex { font-family: var(--mono); font-size: 10px; color: var(--text-3); }
+.sw-inline {
+  display: inline-block; width: 11px; height: 11px; vertical-align: -1px; margin-right: 5px;
+  border-radius: 2px; border: 1px solid rgba(0,0,0,.18);
+}
+.th-tally { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0 4px; }
+.th-pill {
+  font-family: var(--mono); font-size: 10px; padding: 2px 7px; border-radius: 3px;
+  border: 1px solid transparent; white-space: nowrap;
+}
+.th-pill.bad { background: var(--red-light); color: var(--red-text); border-color: var(--red-badge); }
+.th-pill.ok { background: var(--green-lighter); color: var(--green-dark); border-color: var(--green-mid); }
+.th-pill.neutral { background: var(--bg-3); color: var(--text-3); border-color: var(--border); }
 </style>
 </head>
 <body>
@@ -1116,6 +1142,7 @@ tr.row-unused td:first-child { font-style: italic; }
   <div class="nav-tab" data-view="relationships">Relationships <span class="count" id="cRels">0</span></div>
   <div class="nav-tab" data-view="pages">Pages <span class="count" id="cPages">0</span></div>
   <div class="nav-tab" data-view="unused">Unused <span class="count" id="cUnused">0</span></div>
+  <div class="nav-tab" data-view="theme">Theme <span class="count" id="cTheme">0</span></div>
   <div class="nav-tab" data-view="notes">Notes</div>
   <div class="nav-tab" data-view="export">Export</div>
 </nav>
@@ -1145,6 +1172,7 @@ tr.row-unused td:first-child { font-style: italic; }
   <div class="view" id="view-relationships" style="padding:0"><div id="relationshipsContent" style="height:100%"></div></div>
   <div class="view" id="view-pages" style="padding:0"><div id="pagesContent" style="height:100%"></div></div>
   <div class="view" id="view-unused"><div class="view-inner" id="unusedContent"></div></div>
+  <div class="view" id="view-theme"><div class="view-inner" id="themeContent"></div></div>
   <div class="view" id="view-notes"><div class="view-inner" id="notesContent"></div></div>
   <div class="view" id="view-export"><div class="view-inner" id="exportContent"></div></div>
 
@@ -1176,6 +1204,8 @@ const App = {
     roles: [],            // [{name, modelPermission, tablePermissions:[{table, dax}]}] from roles/*.tmdl
     perspectives: [],     // [{name, members:[{kind, table, name}]}] from perspectives/*.tmdl
     functions: [],        // [{name, dax}] DAX user-defined functions from functions.tmdl
+    theme: null,          // { baseName, customName, merged, palette } from StaticResources
+    themeShowAllColors: false,  // expand the full data-colour palette?
     reportMeasures: [],   // report-level measures from PBIR reportExtensions.json
     activeView: 'overview',
     activeTable: null,
@@ -2446,7 +2476,12 @@ function parseReport(text) {
       const width = Math.round(vc.width ?? layoutPos.width ?? 0);
       const height = Math.round(vc.height ?? layoutPos.height ?? 0);
       const tabOrder = layoutPos.tabOrder ?? null;
-      return { type, fields, x, y, z, width, height, tabOrder };
+      return {
+        type, fields, x, y, z, width, height, tabOrder,
+        id: cfg.name || '',
+        title: formatObjectText((singleVisual.vcObjects || {}).title, 'text'),
+        styleScopes: { objects: singleVisual.objects || {}, vcObjects: singleVisual.vcObjects || {} },
+      };
     });
     return {
       name: s.name || '',
@@ -2599,6 +2634,28 @@ async function parsePbirReport(byPath, pagesRoot) {
 }
 
 /* Parse a single PBIR visual.json into the same shape parseReport's visuals use. */
+/* Formatting values are wrapped as { expr: { Literal: { Value: "'text'" } } }. Power BI
+   stores string literals with embedded single quotes, so peel those too. Returns '' for
+   anything driven by a measure or conditional-formatting rule rather than a constant. */
+function literalValue(node) {
+  if (!node || typeof node !== 'object') return '';
+  const lit = node.expr && node.expr.Literal && node.expr.Literal.Value;
+  if (typeof lit !== 'string') return '';
+  return lit.replace(/^'(.*)'$/s, '$1');
+}
+/* Formatting objects are arrays of { properties: {...} } — pull one property's literal. */
+function formatObjectText(objArray, prop) {
+  if (!Array.isArray(objArray)) return '';
+  for (const entry of objArray) {
+    const text = literalValue(entry && entry.properties && entry.properties[prop]);
+    if (text) return text;
+  }
+  return '';
+}
+function pbirVisualTitle(visual) {
+  return formatObjectText((visual.visualContainerObjects || {}).title, 'text');
+}
+
 function parsePbirVisual(vJson) {
   const visual = (vJson && vJson.visual) || {};
   const type = visual.visualType || 'unknown';
@@ -2623,7 +2680,13 @@ function parsePbirVisual(vJson) {
     }
   }
 
-  return { type, fields, x, y, z, width, height, tabOrder };
+  return {
+    type, fields, x, y, z, width, height, tabOrder,
+    id: (vJson && vJson.name) || '',
+    title: pbirVisualTitle(visual),
+    // Raw formatting scopes, kept for the Theme tab's override audit.
+    styleScopes: { objects: visual.objects || {}, visualContainerObjects: visual.visualContainerObjects || {} },
+  };
 }
 
 /* Fallback: derive a "Entity.Property" string from a QueryExpressionContainer when the
@@ -2783,6 +2846,138 @@ async function parsePerspectivesFolder(byPath, smRoot) {
     out.push(persp);
   }
   return out;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   THEME & STYLING
+   ═══════════════════════════════════════════════════════════════
+   A report's colours and fonts come overwhelmingly from its THEME, not from the visuals:
+   across two real reports, 44 visuals carried 36 colour properties, 4 font sizes and zero
+   font families, and a 3-visual report carried none at all. So the theme files are the
+   answer to "what fonts and colours does this report use", and the interesting per-visual
+   signal is the opposite question — where someone deviated from the theme.
+
+   Note what is NOT knowable: the exact set of colours a page renders. A chart without
+   overrides takes theme colours by series index, and the number of series depends on the
+   DATA, which a PBIP does not contain. Conditional formatting is likewise value-driven.
+   This surfaces the palette and the explicit deviations, and claims nothing more. */
+
+/* Power BI stores literals as "'#FF0000'" (quoted) or "20D" (double suffix). */
+function styleLiteral(node) {
+  const raw = literalValue(node);
+  if (!raw) return '';
+  return raw.replace(/^([0-9.]+)D$/, '$1');
+}
+
+/* Apply a ThemeDataColor Percent to a palette hex. Positive tints toward white, negative
+   shades toward black — the same convention as the theme colour picker's lighter/darker
+   variants. */
+function shadeHex(hex, percent) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(String(hex || '').trim());
+  if (!m || !percent) return m ? '#' + m[1].toUpperCase() : '';
+  const n = parseInt(m[1], 16);
+  const ch = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map(v => {
+    const target = percent > 0 ? 255 : 0;
+    const t = Math.min(1, Math.abs(percent));
+    return Math.round(v + (target - v) * t);
+  });
+  return '#' + ch.map(v => v.toString(16).padStart(2, '0')).join('').toUpperCase();
+}
+
+/* Resolve one colour-valued formatting property to { hex, kind, detail }.
+   kind: 'literal' (hardcoded), 'theme' (palette reference), 'dynamic' (data-driven). */
+function resolveStyleColor(node, palette) {
+  if (!node || typeof node !== 'object') return null;
+  const inner = (node.solid && node.solid.color) || node;
+  const expr = inner && inner.expr;
+  if (!expr) return null;
+  if (expr.ThemeDataColor) {
+    const { ColorId = 0, Percent = 0 } = expr.ThemeDataColor;
+    const base = (palette || [])[ColorId] || '';
+    return {
+      hex: shadeHex(base, Percent) || base,
+      kind: 'theme',
+      detail: `theme colour ${ColorId}${Percent ? ` @ ${Math.round(Percent * 100)}%` : ''}`,
+    };
+  }
+  if (expr.Literal) {
+    const v = styleLiteral(inner);
+    if (/^#[0-9a-f]{3,8}$/i.test(v)) return { hex: v.toUpperCase(), kind: 'literal', detail: 'hardcoded' };
+    return null;
+  }
+  // Conditional formatting / measure-driven fills resolve against data we don't have.
+  return { hex: '', kind: 'dynamic', detail: 'data-driven (conditional formatting)' };
+}
+
+/* Walk a visual's formatting objects and collect explicit colour/font settings. */
+function extractStyleOverrides(objectScopes, palette) {
+  const out = [];
+  for (const [scope, objs] of Object.entries(objectScopes || {})) {
+    for (const [objName, entries] of Object.entries(objs || {})) {
+      for (const entry of (Array.isArray(entries) ? entries : [])) {
+        const props = entry && entry.properties;
+        if (!props) continue;
+        for (const [prop, val] of Object.entries(props)) {
+          if (/color$/i.test(prop) || prop === 'fill' || prop === 'background') {
+            const c = resolveStyleColor(val, palette);
+            if (c) out.push({ scope, object: objName, prop, type: 'color', ...c });
+          } else if (prop === 'fontFamily' || prop === 'fontSize') {
+            const v = styleLiteral(val);
+            // Labelled 'hardcoded' like a literal colour: a pinned font size is the same
+            // governance concern — it won't follow a theme change either.
+            if (v) out.push({ scope, object: objName, prop, type: 'font', value: v, kind: 'literal', detail: 'hardcoded' });
+          }
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/* Load the theme JSON files a report references. `themeCollection` names the base theme
+   (shipped under StaticResources/SharedResources/BaseThemes) and optionally a custom theme
+   (uploaded into StaticResources/RegisteredResources). A custom theme overrides the base
+   key-by-key rather than replacing it wholesale. */
+async function parseThemes(byPath, reportRoot, themeCollection, legacyThemeName) {
+  const readJson = async (key) => {
+    try { return JSON.parse(await byPath[key].text()); } catch (e) { return null; }
+  };
+  const findFile = (folder, name) => {
+    if (!name) return '';
+    const want = String(name).replace(/\.json$/i, '').toLowerCase();
+    return Object.keys(byPath).find(k =>
+      k.startsWith(`${reportRoot}/StaticResources/${folder}/`) && k.endsWith('.json') &&
+      k.split('/').pop().replace(/\.json$/i, '').toLowerCase() === want) || '';
+  };
+
+  const tc = themeCollection || {};
+  const baseName = (tc.baseTheme && tc.baseTheme.name) || '';
+  const customName = (tc.customTheme && tc.customTheme.name) || legacyThemeName || '';
+
+  let baseKey = findFile('SharedResources/BaseThemes', baseName);
+  if (!baseKey) {
+    baseKey = Object.keys(byPath).find(k =>
+      k.startsWith(`${reportRoot}/StaticResources/SharedResources/BaseThemes/`) && k.endsWith('.json')) || '';
+  }
+  const customKey = findFile('RegisteredResources', customName);
+
+  const base = baseKey ? await readJson(baseKey) : null;
+  const custom = customKey ? await readJson(customKey) : null;
+  if (!base && !custom) return null;
+
+  // Shallow merge is correct here: a custom theme replaces whole keys (the entire
+  // dataColors array, one semantic colour, one text class) rather than merging inside them.
+  const merged = { ...(base || {}) , ...(custom || {}) };
+  merged.textClasses = { ...((base || {}).textClasses || {}), ...((custom || {}).textClasses || {}) };
+
+  return {
+    baseName: (base && base.name) || baseName || '',
+    customName: (custom && custom.name) || (customName ? customName.replace(/\.json$/i, '') : ''),
+    baseFile: baseKey ? baseKey.split('/').pop() : '',
+    customFile: customKey ? customKey.split('/').pop() : '',
+    merged,
+    palette: merged.dataColors || [],
+  };
 }
 
 function buildUsageIndex() {
@@ -3255,17 +3450,35 @@ async function processFiles(fileList) {
     if (m) { pbirPagesRoot = m[1]; break; }
   }
   const legacyKey = Object.keys(byPath).find(k => /\.Report\/report\.json$/.test(k));
+  // Theme files live under the .Report folder for both formats.
+  const reportRoot = pbirPagesRoot
+    ? pbirPagesRoot.replace(/\/definition\/pages$/, '')
+    : (legacyKey ? legacyKey.replace(/\/report\.json$/, '') : '');
+  let themeCollection = null, legacyThemeName = '';
+
   if (pbirPagesRoot) {
     setLoadingText('Parsing report pages…');
     const { pages, references, reportMeasures } = await parsePbirReport(byPath, pbirPagesRoot);
     App.state.pages = pages;
     App.state.reportReferences = references;
     App.state.reportMeasures = reportMeasures || [];
+    // PBIR keeps the theme reference in definition/report.json.
+    try {
+      const rj = JSON.parse(await byPath[`${pbirPagesRoot.replace(/\/pages$/, '')}/report.json`].text());
+      themeCollection = rj.themeCollection || null;
+    } catch (e) {}
   } else if (legacyKey) {
     const text = await byPath[legacyKey].text();
     App.state.pages = parseReport(text);
     App.state.reportReferences = extractAllReportReferences(text);
     App.state.reportMeasures = [];
+    // Legacy keeps it in the stringified config blob, plus a top-level custom theme file name.
+    try {
+      const rj = JSON.parse(text);
+      const cfg = typeof rj.config === 'string' ? JSON.parse(rj.config) : (rj.config || {});
+      themeCollection = cfg.themeCollection || null;
+      legacyThemeName = typeof rj.theme === 'string' ? rj.theme : '';
+    } catch (e) {}
   } else {
     App.state.pages = [];
     App.state.reportReferences = new Set();
@@ -3276,6 +3489,10 @@ async function processFiles(fileList) {
   // does. A column used only by an RLS filter, or a measure exposed only through a
   // perspective, was being reported as unused — a false positive that invites deleting
   // something load-bearing. Both live in their own TMDL sub-folders.
+  App.state.theme = reportRoot
+    ? await parseThemes(byPath, reportRoot, themeCollection, legacyThemeName)
+    : null;
+
   setLoadingText('Parsing roles and perspectives…');
   App.state.functions = isTmsl
     ? tmsl.functions
@@ -3324,6 +3541,7 @@ function updateCounts() {
   App.els.cRels.textContent = visRels.length;
   App.els.cPages.textContent = App.state.pages.length;
   if (App.els.cUnused) App.els.cUnused.textContent = countUnused();
+  if (App.els.cTheme) App.els.cTheme.textContent = App.state.theme ? (App.state.theme.palette || []).length : 0;
   // Update the hidden-tables toggle label
   if (App.els.hiddenToggleLabel) {
     const total = countHiddenTables();
@@ -4603,6 +4821,152 @@ function renderUnusedSection(title, bucket, kind, isStructural) {
    Update this when you add a new feature or fix an edge case so
    future-you knows what the parser actually handles.
    ═══════════════════════════════════════════════════════════════ */
+/* Collect every explicit colour/font setting across all pages, with where it came from. */
+function collectStyleOverrides() {
+  const palette = (App.state.theme && App.state.theme.palette) || [];
+  const rows = [];
+  for (const page of App.state.pages || []) {
+    for (const v of page.visuals || []) {
+      for (const o of extractStyleOverrides(v.styleScopes, palette)) {
+        rows.push({ page: page.displayName, visual: v.title || v.type, visualType: v.type, ...o });
+      }
+    }
+  }
+  return rows;
+}
+
+const SEMANTIC_COLORS = [
+  ['foreground', 'Text'], ['background', 'Background'], ['tableAccent', 'Table accent'],
+  ['good', 'Good'], ['neutral', 'Neutral'], ['bad', 'Bad'],
+  ['maximum', 'Max'], ['center', 'Center'], ['minimum', 'Min'],
+  ['hyperlink', 'Hyperlink'], ['visitedHyperlink', 'Visited link'],
+];
+
+function renderTheme() {
+  const c = App.els.themeContent;
+  if (!c) return;
+  const t = App.state.theme;
+  if (!t) {
+    c.innerHTML = `<div class="card"><div class="card-body" style="color:var(--text-3)">
+      No theme files found under <code>.Report/StaticResources/</code>. A report always has a
+      base theme, so this usually means the folder wasn't included in what was dropped.
+    </div></div>`;
+    return;
+  }
+  const m = t.merged || {};
+  const rows = collectStyleOverrides();
+  const hardcoded = rows.filter(r => r.kind === 'literal');
+  const themed = rows.filter(r => r.kind === 'theme');
+  const dynamic = rows.filter(r => r.kind === 'dynamic');
+
+  const swatch = (hex, label, sub) => `
+    <div class="sw">
+      <div class="sw-chip" style="background:${esc(hex)}"></div>
+      <div class="sw-meta"><div class="sw-label">${esc(label)}</div>
+      <div class="sw-hex">${esc(String(hex || '').toUpperCase())}${sub ? ' · ' + esc(sub) : ''}</div></div>
+    </div>`;
+
+  const textClasses = Object.entries(m.textClasses || {});
+  // A real theme can declare hundreds of data colours (one sample ships 480). Power BI's own
+  // picker foregrounds the first handful as the series colours, so mirror that rather than
+  // carpeting the page with swatches.
+  const PRIMARY_COUNT = 8;
+  const palette = t.palette || [];
+  const primary = palette.slice(0, PRIMARY_COUNT);
+  const rest = palette.slice(PRIMARY_COUNT);
+  const showAll = !!App.state.themeShowAllColors;
+
+  c.innerHTML = `
+    <div class="card">
+      <div class="card-head">Active theme</div>
+      <div class="card-body">
+        <div style="display:flex;gap:26px;flex-wrap:wrap;font-size:13px">
+          <div><div class="th-k">Base theme</div><div class="th-v">${esc(t.baseName || '—')}</div>
+            ${t.baseFile ? `<div class="th-f">${esc(t.baseFile)}</div>` : ''}</div>
+          <div><div class="th-k">Custom theme</div><div class="th-v">${esc(t.customName || 'none')}</div>
+            ${t.customFile ? `<div class="th-f">${esc(t.customFile)}</div>` : ''}</div>
+        </div>
+        ${t.customName ? `<div class="th-note">A custom theme replaces the base theme key by key —
+          the palette, a semantic colour, or a text class — so what's shown below is the effective result.</div>` : ''}
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">Data colours <span class="source-count">${palette.length}</span></div>
+      <div class="card-body">
+        <div class="sw-grid">${primary.map((hex, i) => swatch(hex, `Colour ${i}`, i === 0 ? 'first series' : '')).join('')}</div>
+        ${rest.length ? `
+          <button class="btn small" id="themeAllColors" style="margin-top:12px">
+            ${showAll ? 'Hide' : 'Show'} the remaining ${rest.length}
+          </button>
+          ${showAll ? `<div class="sw-grid" style="margin-top:12px">${rest.map((hex, i) => swatch(hex, `Colour ${i + PRIMARY_COUNT}`, '')).join('')}</div>` : ''}
+        ` : ''}
+        <div class="th-note">Charts take these by series index, so which ones a given visual shows
+          depends on its data — which a PBIP doesn't contain. This is the palette available, not a
+          census of what's on screen.${rest.length ? ` Power BI's colour picker surfaces the first
+          ${PRIMARY_COUNT} as the main series colours; the rest are generated tints and shades.` : ''}</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">Semantic colours</div>
+      <div class="card-body"><div class="sw-grid">
+        ${SEMANTIC_COLORS.filter(([k]) => m[k]).map(([k, label]) => swatch(m[k], label, k)).join('')
+          || '<span style="color:var(--text-3)">None defined.</span>'}
+      </div></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">Fonts <span class="source-count">${textClasses.length} text classes</span></div>
+      <div class="card-body">
+        ${textClasses.length ? `<table class="prop-table"><thead><tr>
+          <th>Class</th><th>Font</th><th>Size</th><th>Colour</th><th>Preview</th></tr></thead><tbody>
+          ${textClasses.map(([name, def]) => `<tr>
+            <td class="m">${esc(name)}</td>
+            <td>${esc(def.fontFace || '—')}</td>
+            <td class="m">${def.fontSize ? esc(def.fontSize) + 'pt' : '—'}</td>
+            <td class="m">${def.color ? `<span class="sw-inline" style="background:${esc(def.color)}"></span>${esc(def.color)}` : '—'}</td>
+            <td style="font-family:${esc(def.fontFace || 'inherit')};font-size:${Math.min(20, def.fontSize || 13)}px">Aa Bb Cc 123</td>
+          </tr>`).join('')}</tbody></table>`
+        : '<span style="color:var(--text-3)">This theme defines no text classes, so fonts come from Power BI defaults.</span>'}
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        Styling overrides
+        <span class="source-count">${rows.length} across ${App.state.pages.length} page${App.state.pages.length !== 1 ? 's' : ''}</span>
+      </div>
+      <div class="card-body">
+        <div class="th-note">Where a visual sets a colour or font itself instead of inheriting the
+          theme. <strong>Hardcoded</strong> values are the ones worth reviewing — they don't follow
+          a theme change. Theme references are fine; they're listed so you can see the palette in use.</div>
+        <div class="th-tally">
+          <span class="th-pill bad">${hardcoded.length} hardcoded</span>
+          <span class="th-pill ok">${themed.length} theme reference${themed.length !== 1 ? 's' : ''}</span>
+          <span class="th-pill neutral">${dynamic.length} data-driven</span>
+        </div>
+        ${rows.length ? `<table class="prop-table"><thead><tr>
+            <th>Page</th><th>Visual</th><th>Property</th><th>Value</th><th>Source</th></tr></thead><tbody>
+            ${rows.slice().sort((a, b) => (a.kind === 'literal' ? -1 : 1) - (b.kind === 'literal' ? -1 : 1))
+              .map(r => `<tr>
+                <td>${esc(r.page)}</td>
+                <td>${esc(r.visual)} <span class="th-f">${esc(r.visualType)}</span></td>
+                <td class="m">${esc(r.object)}.${esc(r.prop)}</td>
+                <td class="m">${r.type === 'color'
+                  ? (r.hex ? `<span class="sw-inline" style="background:${esc(r.hex)}"></span>${esc(r.hex)}` : '<em style="color:var(--text-3)">varies</em>')
+                  : esc(r.value)}</td>
+                <td><span class="th-pill ${r.kind === 'literal' ? 'bad' : r.kind === 'theme' ? 'ok' : 'neutral'}">${esc(r.detail || r.kind)}</span></td>
+              </tr>`).join('')}
+          </tbody></table>`
+        : '<span style="color:var(--text-3)">No explicit colour or font overrides — every visual inherits the theme. That\'s the tidy case.</span>'}
+      </div>
+    </div>`;
+
+  const btn = c.querySelector('#themeAllColors');
+  if (btn) btn.onclick = () => { App.state.themeShowAllColors = !App.state.themeShowAllColors; renderTheme(); };
+}
+
 function renderNotes() {
   const c = App.els.notesContent;
   c.innerHTML = `
@@ -5595,6 +5959,7 @@ function renderActive() {
   else if (v === 'relationships') renderRelationships();
   else if (v === 'pages') renderPages();
   else if (v === 'unused') renderUnused();
+  else if (v === 'theme') renderTheme();
   else if (v === 'notes') renderNotes();
   else if (v === 'export') renderExport();
 }
@@ -5922,6 +6287,8 @@ function init() {
   App.els.relationshipsContent = document.getElementById('relationshipsContent');
   App.els.pagesContent = document.getElementById('pagesContent');
   App.els.unusedContent = document.getElementById('unusedContent');
+  App.els.themeContent = document.getElementById('themeContent');
+  App.els.cTheme = document.getElementById('cTheme');
   App.els.notesContent = document.getElementById('notesContent');
   App.els.exportContent = document.getElementById('exportContent');
   App.els.cSources = document.getElementById('cSources');
