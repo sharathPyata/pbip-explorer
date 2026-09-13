@@ -90,7 +90,7 @@ My report/
     └── report.json
 ```
 
-PBIP Explorer reads the `.SemanticModel/definition/*.tmdl` files for the data model. Both report formats are auto-detected: the legacy single `.Report/report.json` and the newer **PBIR** per-file format (`.Report/definition/pages/[pageName]/visuals/[visualName]/visual.json`) introduced in 2026.
+PBIP Explorer reads **both** semantic-model formats. TMDL (`.SemanticModel/definition/*.tmdl`, a folder of text files) and TMSL (`.SemanticModel/model.bim`, a single JSON file) are auto-detected — TMDL is still a Power BI Desktop preview option, so plenty of projects are saved as TMSL, and both load identically. Both report formats are auto-detected: the legacy single `.Report/report.json` and the newer **PBIR** per-file format (`.Report/definition/pages/[pageName]/visuals/[visualName]/visual.json`) introduced in 2026.
 
 ---
 
@@ -114,11 +114,13 @@ PBIP Explorer reads the `.SemanticModel/definition/*.tmdl` files for the data mo
 
 | Layer | Detail |
 |---|---|
+| **TMSL** (`model.bim`) | The same object tree as TMDL, in JSON — tables, columns, measures, partitions, hierarchies, calculation groups, relationships, shared expressions, roles, perspectives, data sources and functions. Converted to identical internal state, so every tab behaves the same. The implicit TOM `RowNumber` column is skipped, and `string \| string[]` text properties are joined. |
 | **TMDL** | Model annotations, tables, columns (data types, format strings, sort-by, lineage tags), measures (DAX, single-line / triple-backtick / indented), calculated columns, hierarchies, calculation groups (with precedence and items), partitions (Power Query M / calculated / calculation-group), table relationships |
 | **M (Power Query)** | Connector patterns, inline data (`Table.FromRecords`, `Table.FromRows`, base64+deflate-compressed inline data), SQL extracted from native queries, all M string escape sequences (`#(lf)`, `#(cr)`, `#(2605)`, etc.) |
 | **Report JSON** | Pages, visuals, field bindings (`queryRef`, structured `Column` / `Measure` / `Hierarchy` / `HierarchyLevel` refs), visual positions and z-order, filter references, conditional formatting refs |
 | **Report extras (PBIR)** | `report.json` report-level filters, `reportExtensions.json` report-level measures (name, DAX, table), `bookmarks/*.bookmark.json` captured filter state |
 | **Security & curation** | `roles/*.tmdl` RLS roles (`modelPermission`, `tablePermission` filter DAX), `perspectives/*.tmdl` membership |
+| **DAX functions** | `functions.tmdl` user-defined functions — the body's column/measure references count as usage |
 | **Declared sources** | `dataSources.tmdl` explicit provider data sources, with host/database pulled from the connection string |
 
 ---
@@ -146,7 +148,7 @@ Multiple expressions pointing to the same host collapse into one source card.
 
 The **Unused** tab classifies each column / measure into:
 
-- **Used** — referenced by a visual binding, filter, DAX expression, or M code of a used table; by a **row-level-security filter**; by a **report-level measure**; or by a **bookmark's** captured state
+- **Used** — referenced by a visual binding, filter, DAX expression, or M code of a used table; by a **row-level-security filter**; by a **report-level measure**; by a **bookmark's** captured state; or by a **DAX user-defined function** body
 - **Structural only** — referenced only by relationships, `sortByColumn`, hierarchy levels, or **perspective membership** (usually safe to keep)
 - **Unused** — no references anywhere
 
@@ -175,8 +177,8 @@ This means you can drop a PBIP that contains internal SQL, schema names, or sens
 
 ## Known limitations
 
-- **TMSL (`model.bim`) models aren't read** — only the TMDL format (`definition/model.tmdl`) is. TMDL is still a preview option in Power BI Desktop (*Options > Preview features > "Store semantic model using TMDL format"*), so a project saved without it won't load; the app says so explicitly rather than claiming the folder is malformed.
-- **`functions.tmdl` (DAX user-defined functions) and `cultures/*.tmdl` aren't parsed**, so objects referenced only from a UDF body or a linguistic schema can still show as unused.
+- **`cultures/*.tmdl` (Q&A linguistic schema) is deliberately not counted as usage.** Power BI auto-generates a synonym entity for every table and every column, so treating the linguistic schema as a reference would mark the entire model "used" and render the Unused tab meaningless. This is an intentional exclusion, not a gap.
+- **Multi-line calculated-column DAX** in the backtick-fenced form is fully read; the indented form is read for the common cases.
 
 - **Multi-line calculated-column DAX** (backtick-fenced or indented) is only partially captured — single-line definitions are fully read.
 - **KPI definitions, detail-rows expressions, formatStringDefinition DAX** are present in the model but not parsed for entity references.

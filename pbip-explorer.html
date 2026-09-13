@@ -1171,9 +1171,11 @@ const App = {
     relationships: [],    // [{id, fromTable, fromColumn, toTable, toColumn, crossFiltering, securityFiltering}]
     sources: [],          // [{key, name, type, server, description, queries:[tableName]}]
     pages: [],            // [{name, displayName, visuals:[{type, fields:[]}]}]
-    modelAnnotations: {}, // raw annotations from model.tmdl
+    modelAnnotations: {}, // raw annotations from model.tmdl / model.bim
+    modelFormat: '',      // 'TMDL' (definition/*.tmdl) or 'TMSL' (model.bim)
     roles: [],            // [{name, modelPermission, tablePermissions:[{table, dax}]}] from roles/*.tmdl
     perspectives: [],     // [{name, members:[{kind, table, name}]}] from perspectives/*.tmdl
+    functions: [],        // [{name, dax}] DAX user-defined functions from functions.tmdl
     reportMeasures: [],   // report-level measures from PBIR reportExtensions.json
     activeView: 'overview',
     activeTable: null,
@@ -1669,6 +1671,211 @@ function mergeTableInto(target, extra) {
   if (extra.annotations) target.annotations = { ...(extra.annotations), ...(target.annotations || {}) };
   if (extra.isHidden) target.isHidden = true;
   return target;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   TMSL PARSING  (model.bim)
+   ═══════════════════════════════════════════════════════════════
+   A semantic model is stored in ONE of two formats. TMDL (definition/*.tmdl) is what the
+   rest of this file parses, but it is still a Power BI Desktop preview option ("Store
+   semantic model using TMDL format"), so a project saved with it switched off gets a single
+   TMSL file — model.bim — holding the same TOM object tree as JSON.
+
+   Rather than duplicate the downstream logic, this converts TMSL into exactly the shapes the
+   TMDL parsers emit, so sources, usage analysis, rendering and export all work unchanged.
+   TMSL is TOM serialised directly, so the mapping is mechanical; the fiddly parts are that
+   many text properties may be EITHER a string or an array of lines, and that annotations are
+   an array of {name, value} rather than an object. */
+
+/* TMSL text properties are `string | string[]` almost everywhere (TOM splits long values into
+   lines on serialize). Join arrays back into one value. */
+function tmslText(v) {
+  if (Array.isArray(v)) return v.join('\n');
+  return v == null ? '' : String(v);
+}
+/* annotations: [{name, value}] → { name: value } to match the TMDL parser's shape. */
+function tmslAnnotations(arr) {
+  const out = {};
+  for (const a of (arr || [])) if (a && a.name != null) out[a.name] = tmslText(a.value).trim();
+  return out;
+}
+
+function parseTmslModel(bim) {
+  const model = (bim && bim.model) || {};
+  const tables = [];
+
+  for (const t of (model.tables || [])) {
+    if (!t || !t.name) continue;
+
+    const columns = [];
+    const hierColumnRefs = new Set();
+    for (const c of (t.columns || [])) {
+      if (!c || !c.name) continue;
+      // TOM adds an implicit RowNumber column to every table; it isn't a real field and the
+      // Fields pane never shows it, so treat it the way the TMDL path treats hidden system
+      // objects rather than inflating every table's column count by one.
+      if (c.type === 'rowNumber') continue;
+      columns.push({
+        name: c.name,
+        dataType: c.dataType || '',
+        isHidden: !!c.isHidden,
+        sortByColumn: unquote(String(c.sortByColumn || '').trim()),
+        sourceColumn: String(c.sourceColumn || '').trim(),
+        displayFolder: String(c.displayFolder || '').trim(),
+        formatString: String(c.formatString || '').trim(),
+        summarizeBy: String(c.summarizeBy || '').trim(),
+        // Only a calculated column carries DAX; a plain data column's `expression` is absent.
+        calcDax: (c.type === 'calculated' || c.type === 'calculatedTableColumn')
+          ? tmslText(c.expression).trim() : '',
+      });
+    }
+
+    const measures = [];
+    for (const m of (t.measures || [])) {
+      if (!m || !m.name) continue;
+      measures.push({
+        name: m.name,
+        dax: tmslText(m.expression).trim(),
+        displayFolder: String(m.displayFolder || '').trim(),
+        formatString: String(m.formatString || '').trim(),
+      });
+    }
+
+    const hierarchies = [];
+    for (const h of (t.hierarchies || [])) {
+      if (!h || !h.name) continue;
+      hierarchies.push(h.name);
+      for (const lv of (h.levels || [])) if (lv && lv.column) hierColumnRefs.add(lv.column);
+    }
+
+    // Partition → the single partitionSource/partitionKind/mode the rest of the app expects.
+    // TMSL source types: m (Power Query), calculated (DAX), query (native), entity, calculationGroup.
+    const part = (t.partitions || [])[0] || null;
+    const psrc = (part && part.source) || {};
+    let partitionKind = psrc.type || '';
+    if (partitionKind === 'calculationGroup') partitionKind = 'calculationGroup';
+    let partitionSource = tmslText(psrc.expression).trim();
+    if (!partitionSource && psrc.query) partitionSource = tmslText(psrc.query).trim();
+    // An `entity` partition (Direct Lake / dataflow) names its source rather than expressing
+    // it in M; synthesise something detectSource can at least report honestly.
+    if (!partitionSource && psrc.entityName) {
+      partitionSource = `entity: ${psrc.entityName}${psrc.schemaName ? ' (' + psrc.schemaName + ')' : ''}`;
+    }
+
+    const cg = t.calculationGroup || null;
+    const calcItems = [];
+    if (cg) {
+      for (const ci of (cg.calculationItems || [])) {
+        if (!ci || !ci.name) continue;
+        calcItems.push({
+          name: ci.name,
+          dax: tmslText(ci.expression).trim(),
+          ordinal: ci.ordinal ?? null,
+          formatStringDefinition: tmslText(ci.formatStringDefinition && ci.formatStringDefinition.expression).trim(),
+        });
+      }
+      calcItems.sort((a, b) => (a.ordinal ?? 9999) - (b.ordinal ?? 9999));
+    }
+
+    tables.push({
+      name: t.name,
+      description: tmslText(t.description).trim(),
+      columns, measures,
+      partitionSource,
+      mode: (part && part.mode) || 'import',
+      partitionKind,
+      hierarchies,
+      isHidden: !!t.isHidden,
+      isPrivate: !!t.isPrivate,
+      showAsVariationsOnly: !!t.showAsVariationsOnly,
+      isCalcGroup: !!cg,
+      calcItems,
+      calcGroupPrecedence: cg && cg.precedence != null ? cg.precedence : null,
+      annotations: tmslAnnotations(t.annotations),
+      hierColumnRefs: [...hierColumnRefs],
+    });
+  }
+  tables.sort((a, b) => a.name.localeCompare(b.name));
+
+  const expressions = {};
+  for (const e of (model.expressions || [])) {
+    if (!e || !e.name) continue;
+    expressions[e.name] = {
+      description: tmslText(e.description).trim(),
+      sourceM: tmslText(e.expression).trimEnd(),
+    };
+  }
+
+  const relationships = [];
+  for (const r of (model.relationships || [])) {
+    if (!r || !r.fromTable || !r.toTable) continue;
+    relationships.push({
+      id: r.name || `${r.fromTable}-${r.toTable}`,
+      fromTable: r.fromTable, fromColumn: r.fromColumn || '',
+      toTable: r.toTable, toColumn: r.toColumn || '',
+      crossFiltering: r.crossFilteringBehavior || 'singleDirection',
+      securityFiltering: r.securityFilteringBehavior || '',
+    });
+  }
+
+  const roles = [];
+  for (const r of (model.roles || [])) {
+    if (!r || !r.name) continue;
+    roles.push({
+      name: r.name,
+      modelPermission: r.modelPermission || '',
+      // TMSL names the guarded table in the permission's own `name` property.
+      tablePermissions: (r.tablePermissions || [])
+        .filter(tp => tp && tp.filterExpression)
+        .map(tp => ({ table: tp.name || tp.table || '', dax: tmslText(tp.filterExpression).trim() })),
+    });
+  }
+
+  const perspectives = [];
+  for (const p of (model.perspectives || [])) {
+    if (!p || !p.name) continue;
+    const members = [];
+    for (const pt of (p.tables || [])) {
+      if (!pt || !pt.name) continue;
+      // Singular form must match what the TMDL path emits (perspectiveColumn → "column"),
+      // so the two formats produce identical state. Spelled out rather than de-pluralised
+      // by regex, which gets "measures" wrong.
+      const SINGULAR = { columns: 'column', measures: 'measure', hierarchies: 'hierarchy' };
+      for (const [plural, kind] of Object.entries(SINGULAR)) {
+        for (const item of (pt[plural] || [])) {
+          if (item && item.name) members.push({ kind, table: pt.name, name: item.name });
+        }
+      }
+    }
+    perspectives.push({ name: p.name, members });
+  }
+
+  const dataSources = [];
+  for (const ds of (model.dataSources || [])) {
+    if (!ds || !ds.name) continue;
+    const conn = tmslText(ds.connectionString).trim();
+    const cd = ds.connectionDetails || {};
+    dataSources.push({
+      name: ds.name,
+      kind: ds.type || 'provider',
+      connectionString: conn || JSON.stringify(cd),
+      server: cd.address && cd.address.server ? cd.address.server
+        : ((conn.match(/(?:Data Source|Server|Host)\s*=\s*([^;]+)/i) || [])[1] || '').trim(),
+      database: cd.address && cd.address.database ? cd.address.database
+        : ((conn.match(/(?:Initial Catalog|Database)\s*=\s*([^;]+)/i) || [])[1] || '').trim(),
+    });
+  }
+
+  const functions = [];
+  for (const f of (model.functions || [])) {
+    if (f && f.name) functions.push({ name: f.name, dax: tmslText(f.expression).trim() });
+  }
+
+  return {
+    tables, expressions, relationships, roles, perspectives, dataSources, functions,
+    annotations: tmslAnnotations(model.annotations),
+    culture: model.culture || '',
+  };
 }
 
 function annIsTrue(v) {
@@ -2478,6 +2685,47 @@ function parseDataSources(text) {
   return out;
 }
 
+/* functions.tmdl — DAX user-defined functions. TMDL's root file for them; the default
+   property is a DAX expression, so the body takes the same three shapes a measure's does.
+   A column referenced only inside a UDF body would otherwise read as unused. */
+function parseFunctions(text) {
+  const out = [];
+  if (!text) return out;
+  const lines = text.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(/^function\s+(.+?)\s*=\s*(.*)$/);
+    if (!m) continue;
+    const name = unquote(m[1]);
+    const first = m[2];
+    let dax = '';
+    if (first.trim().startsWith('```')) {          // 1. backtick-fenced
+      const parts = [];
+      const rest = first.trim().slice(3);
+      if (rest.trim()) parts.push(rest);
+      let k = i + 1;
+      for (; k < lines.length; k++) {
+        if (lines[k].includes('```')) { const before = lines[k].split('```')[0]; if (before.trim()) parts.push(before); break; }
+        parts.push(lines[k]);
+      }
+      dax = normalizeIndent(parts.join('\n')).trim();
+      i = k;
+    } else if (first.trim()) {                      // 2. single line
+      dax = first.trim();
+    } else {                                        // 3. indented continuation block
+      const parts = [];
+      let k = i + 1;
+      for (; k < lines.length; k++) {
+        if (lines[k].trim() && !/^\s/.test(lines[k])) break;   // next top-level declaration
+        parts.push(lines[k]);
+      }
+      dax = normalizeIndent(parts.join('\n')).trim();
+      i = k - 1;
+    }
+    out.push({ name, dax });
+  }
+  return out;
+}
+
 async function parseRolesFolder(byPath, smRoot) {
   const re = new RegExp(`^${escRe(smRoot)}/definition/roles/.+\\.tmdl$`);
   const paths = Object.keys(byPath).filter(k => re.test(k));
@@ -2610,6 +2858,17 @@ function buildUsageIndex() {
       for (const k of [...columns, ...measures]) {
         if (byKey[k]) byKey[k].direct.push(`RLS role "${role.name}"`);
       }
+    }
+  }
+
+  // 4b2. Direct — DAX user-defined function bodies. We don't track UDF call sites, so this
+  //      errs toward "used", matching the safe-side bias the rest of the detection takes:
+  //      over-reporting a field as used is recoverable, wrongly clearing one for deletion
+  //      is not.
+  for (const fn of (App.state.functions || [])) {
+    const { columns, measures } = parseDaxReferences(fn.dax);
+    for (const k of [...columns, ...measures]) {
+      if (byKey[k]) byKey[k].direct.push(`DAX function ${fn.name}()`);
     }
   }
 
@@ -2831,21 +3090,22 @@ async function processFiles(fileList) {
     byPath[path] = f;
   }
   // Find a SemanticModel folder
+  // A semantic model is stored in ONE of two formats: TMDL (definition/*.tmdl) or TMSL
+  // (a single model.bim). TMDL is still a Desktop preview option, so both are live in the
+  // wild and both are supported — pick whichever this project actually uses.
   const smKey = Object.keys(byPath).find(k => /\.SemanticModel\/definition\/model\.tmdl$/.test(k));
-  if (!smKey) {
-    // A semantic model can be saved in either of two formats, and this parser reads only
-    // TMDL. TMSL (a single model.bim) is what Desktop writes when the "Store semantic model
-    // using TMDL format" preview option is off, so it's a normal project, not a broken one —
-    // say which format was found rather than implying the folder is malformed.
-    const bimKey = Object.keys(byPath).find(k => /\.SemanticModel\/model\.bim$/.test(k));
-    showToast(bimKey
-      ? 'This project stores its model as TMSL (model.bim). PBIP Explorer currently reads only the TMDL format (definition/model.tmdl). In Power BI Desktop: Options > Preview features > "Store semantic model using TMDL format", then re-save.'
-      : 'No semantic model found — expected a .SemanticModel/definition/model.tmdl (TMDL) folder in the dropped project.', 'error');
+  const bimKey = Object.keys(byPath).find(k => /\.SemanticModel\/model\.bim$/.test(k));
+  if (!smKey && !bimKey) {
+    showToast('No semantic model found — expected a .SemanticModel folder containing either definition/model.tmdl (TMDL) or model.bim (TMSL).', 'error');
     return;
   }
-  const smRoot = smKey.replace(/\/definition\/model\.tmdl$/, '');
+  const isTmsl = !smKey;
+  const smRoot = isTmsl
+    ? bimKey.replace(/\/model\.bim$/, '')
+    : smKey.replace(/\/definition\/model\.tmdl$/, '');
   const projectName = smRoot.split('/').pop().replace(/\.SemanticModel$/, '');
   App.state.projectName = projectName;
+  App.state.modelFormat = isTmsl ? 'TMSL' : 'TMDL';
 
   showLoading('Reading files…');
   await nextPaint();  // let the overlay paint before the heavy work starts
@@ -2857,10 +3117,31 @@ async function processFiles(fileList) {
     return normTmdl(await byPath[path].text());
   };
 
-  const modelText = await readText(`${smRoot}/definition/model.tmdl`);
-  const expressionsText = await readText(`${smRoot}/definition/expressions.tmdl`);
-  const relationshipsText = await readText(`${smRoot}/definition/relationships.tmdl`);
+  // ── TMSL branch: one JSON file yields every model object at once ───────────────────────
+  let tmsl = null;
+  if (isTmsl) {
+    setLoadingText('Parsing model.bim…');
+    let bim;
+    try {
+      bim = JSON.parse(await byPath[bimKey].text());
+    } catch (e) {
+      throw new Error('model.bim is not valid JSON: ' + (e && e.message ? e.message : e));
+    }
+    tmsl = parseTmslModel(bim);
+    App.state.modelAnnotations = tmsl.annotations;
+    App.state.tables = tmsl.tables;
+    App.state.expressions = tmsl.expressions;
+    App.state.relationships = tmsl.relationships;
+  }
+  // Shared by both branches: everything below (source grouping, usage, render) is
+  // format-agnostic and works off this list.
+  let tables = isTmsl ? tmsl.tables : [];
 
+  const modelText = isTmsl ? '' : await readText(`${smRoot}/definition/model.tmdl`);
+  const expressionsText = isTmsl ? '' : await readText(`${smRoot}/definition/expressions.tmdl`);
+  const relationshipsText = isTmsl ? '' : await readText(`${smRoot}/definition/relationships.tmdl`);
+
+  if (!isTmsl) {
   // Parse model annotations
   const annotations = {};
   for (const am of (modelText.matchAll(/^annotation\s+(\S+)\s*=\s*(.+)$/gm) || [])) {
@@ -2871,7 +3152,6 @@ async function processFiles(fileList) {
   // Parse all table files — read them in PARALLEL (Promise.all) rather than awaiting
   // each sequentially; large models have many table files and sequential reads are slow.
   setLoadingText('Parsing tables…');
-  const tables = [];
   const tablePathRe = new RegExp(`^${escRe(smRoot)}/definition/tables/.+\\.tmdl$`);
   const tablePaths = Object.keys(byPath).filter(p => tablePathRe.test(p));
   const tableTexts = (await Promise.all(tablePaths.map(p => byPath[p].text()))).map(normTmdl);
@@ -2898,6 +3178,7 @@ async function processFiles(fileList) {
 
   // Parse relationships
   App.state.relationships = parseRelationships(relationshipsText);
+  }  // end TMDL-only parsing
 
   // Build sources — group by (type, host) so multiple expressions hitting the same Snowflake
   // / Dataverse / SQL host collapse into one card.
@@ -2948,7 +3229,10 @@ async function processFiles(fileList) {
     src.queries.push(t.name);
   }
   // Explicit DataSource objects (dataSources.tmdl) sit alongside the M-derived ones.
-  for (const ds of parseDataSources(await readText(`${smRoot}/definition/dataSources.tmdl`))) {
+  const declaredSources = isTmsl
+    ? tmsl.dataSources
+    : parseDataSources(await readText(`${smRoot}/definition/dataSources.tmdl`));
+  for (const ds of declaredSources) {
     const info = {
       key: `datasource:${(ds.server || ds.name).toLowerCase()}:${ds.database.toLowerCase()}`,
       name: ds.database || ds.server || ds.name,
@@ -2993,8 +3277,11 @@ async function processFiles(fileList) {
   // perspective, was being reported as unused — a false positive that invites deleting
   // something load-bearing. Both live in their own TMDL sub-folders.
   setLoadingText('Parsing roles and perspectives…');
-  App.state.roles = await parseRolesFolder(byPath, smRoot);
-  App.state.perspectives = await parsePerspectivesFolder(byPath, smRoot);
+  App.state.functions = isTmsl
+    ? tmsl.functions
+    : parseFunctions(await readText(`${smRoot}/definition/functions.tmdl`));
+  App.state.roles = isTmsl ? tmsl.roles : await parseRolesFolder(byPath, smRoot);
+  App.state.perspectives = isTmsl ? tmsl.perspectives : await parsePerspectivesFolder(byPath, smRoot);
 
   // Build usage index (needs tables + relationships + pages + reportReferences).
   // This is the heaviest synchronous step, so paint the overlay text first.
@@ -4326,6 +4613,7 @@ function renderNotes() {
     </p>
 
     <h2>1. Overview &amp; architecture</h2>
+    <p><strong>Both semantic-model formats are supported.</strong> TMDL (<code>definition/*.tmdl</code>) and TMSL (<code>model.bim</code>) are auto-detected; TMSL is converted by <code>parseTmslModel()</code> into exactly the shapes the TMDL parsers emit, so sources, usage, rendering and export are format-agnostic. Verified by parsing the same model in both formats and diffing the resulting state.</p>
     <p>This is a single, self-contained HTML file. Drop it in a browser, drop a PBIP folder onto it, and it parses + renders everything in-memory. No build step, no server. One third-party library — D3 v7 — is embedded inline (used only for the relationships graph), as are the two webfonts; everything else is vanilla JS + browser APIs.</p>
     <ul>
       <li><strong>File loading:</strong> drag-drop a folder (uses <code>DataTransferItem.webkitGetAsEntry()</code>) or click "Load PBIP Folder" (uses <code>&lt;input type="file" webkitdirectory&gt;</code>).</li>
@@ -4575,6 +4863,8 @@ function renderNotes() {
         <tr><td><strong>Report-level measures</strong></td><td>PBIR <code>definition/reportExtensions.json</code> &rarr; <code>entities[].measures[].expression</code>. These measures live in the report, not the model, so their DAX is often the only reference to a model column.</td><td>Direct</td></tr>
         <tr><td><strong>Report-level filters</strong></td><td>PBIR <code>definition/report.json</code> — walked by the same recursive extractor as pages and visuals</td><td>Direct</td></tr>
         <tr><td><strong>Bookmarks</strong></td><td>PBIR <code>definition/bookmarks/*.bookmark.json</code> — a bookmark captures filter and slicer state, which can be the only place a field is referenced</td><td>Direct</td></tr>
+        <tr><td><strong>DAX user-defined function</strong></td><td><code>functions.tmdl</code> &rarr; <code>function F = &lt;DAX&gt;</code>. Call sites aren't tracked, so a reference inside any UDF body counts — the same safe-side bias the rest of the detection takes.</td><td>Direct</td></tr>
+        <tr><td><strong>Q&amp;A linguistic schema</strong></td><td><code>cultures/*.tmdl</code> — <strong>deliberately ignored.</strong> Power BI auto-generates a synonym entity for every table and column, so counting it would mark the whole model used and make this tab useless.</td><td>Not counted</td></tr>
         <tr><td><strong>Perspective membership</strong></td><td><code>perspectives/*.tmdl</code> &rarr; <code>perspectiveColumn</code> / <code>perspectiveMeasure</code> / <code>perspectiveHierarchy</code>. Structural rather than direct: curation is deliberate, but doesn't prove anything consumes the field.</td><td>Structural</td></tr>
       </tbody>
     </table>
