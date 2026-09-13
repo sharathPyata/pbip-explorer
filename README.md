@@ -155,7 +155,7 @@ Detection is regex-based and errs on the safe side: if a column name appears in 
 
 - **Local-only.** All parsing happens in your browser via the File API. No requests are made to any server.
 - **No telemetry.** No analytics, no ping, nothing phones home.
-- **No external dependencies.** Everything is embedded inline — D3.js (for the relationships graph), all CSS, all JS. No webfont is fetched either: typography uses locally installed families where available and falls back to your platform's UI and monospace faces.
+- **No external dependencies.** Everything is embedded inline — D3.js (for the relationships graph), both webfonts (base64 WOFF2), all CSS, all JS. Nothing is fetched from a CDN or from Google Fonts, so the page loads and renders identically on an air-gapped machine.
 - **Open directly from disk.** No web server required; double-click works.
 
 This means you can drop a PBIP that contains internal SQL, schema names, or sensitive data into the page without worrying about anything leaving your machine.
@@ -186,6 +186,20 @@ This means you can drop a PBIP that contains internal SQL, schema names, or sens
 - In **Pages → All Pages**, click any page name to drill into just that page's view. The search box at the top works in both All Pages and single-page views.
 - The relationships graph supports **drag** (reposition a node), **scroll** (zoom), **hover** (highlight), and the **Fit** button (reset zoom).
 - Hidden tables (auto-date tables, `isHidden` flags) are filtered out by default to match Power BI Desktop's Fields pane. Toggle **Show N hidden** in the header to see them.
+
+---
+
+## Credits & licences
+
+PBIP Explorer itself is MIT-licensed (see [LICENSE](LICENSE)). Three third-party assets are bundled inline:
+
+| Asset | Used for | Licence |
+|---|---|---|
+| [D3](https://d3js.org/) v7 | Relationships force-directed graph | ISC |
+| [Source Sans 3](https://github.com/adobe-fonts/source-sans) | UI typeface | [SIL OFL 1.1](https://scripts.sil.org/OFL) |
+| [JetBrains Mono](https://github.com/JetBrains/JetBrainsMono) | Code / DAX / M typeface | [SIL OFL 1.1](https://scripts.sil.org/OFL) |
+
+The fonts remain under the OFL; their copyright notices travel with the `@font-face` block at the top of the file's `<style>` element.
 
 ---
 
