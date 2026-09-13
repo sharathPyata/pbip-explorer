@@ -155,7 +155,7 @@ Detection is regex-based and errs on the safe side: if a column name appears in 
 
 - **Local-only.** All parsing happens in your browser via the File API. No requests are made to any server.
 - **No telemetry.** No analytics, no ping, nothing phones home.
-- **No external dependencies.** Everything is embedded inline — D3.js (for the relationships graph in the full version), all CSS, all JS.
+- **No external dependencies.** Everything is embedded inline — D3.js (for the relationships graph), all CSS, all JS. No webfont is fetched either: typography uses locally installed families where available and falls back to your platform's UI and monospace faces.
 - **Open directly from disk.** No web server required; double-click works.
 
 This means you can drop a PBIP that contains internal SQL, schema names, or sensitive data into the page without worrying about anything leaving your machine.

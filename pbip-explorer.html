@@ -4,7 +4,6 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>PBIP Explorer</title>
-<link href="https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
 :root {
   --bg: #eef1ef;
@@ -41,8 +40,10 @@
   --shadow-sm: 0 1px 3px rgba(0,0,0,0.06);
   --shadow-md: 0 3px 10px rgba(0,0,0,0.08);
   --shadow-lg: 0 6px 24px rgba(0,0,0,0.12);
-  --mono: 'JetBrains Mono', Menlo, Consolas, monospace;
-  --sans: 'Source Sans 3', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  /* No webfont is fetched — these resolve against locally installed families and fall
+     back to the platform UI/mono face, keeping the page free of any network call. */
+  --mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+  --sans: 'Source Sans 3', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 html, body { height: 100%; }
@@ -1902,8 +1903,18 @@ function detectSource(mCode, expressions, tablesList, visited) {
   if (!mCode) return { key: 'unknown', name: 'Unknown', type: 'other', server: '' };
   visited = visited || new Set();
 
-  // 1. Shared expression reference → route to that expression's underlying source
+  // 1. Shared expression reference → route to that expression's underlying source.
+  //    A bare name only counts as a reference if this query's own `let` block doesn't
+  //    bind the same name: in M the nearest binding wins, so a local step shadows the
+  //    shared expression. This matters because Power Query names its first step
+  //    `Source` by convention — without the shadow check, a shared expression called
+  //    `Source` (or `Data`, `Date`, any other common step name) matches inside nearly
+  //    every query in the model and claims all of them, silently beating the correct
+  //    direct-connector detection in step 3 below.
+  const localSteps = parseMSteps(mCode);
+  const shadowed = new Set(localSteps ? localSteps.steps.map(st => st.name) : []);
   for (const ename of Object.keys(expressions)) {
+    if (shadowed.has(ename)) continue;
     const re = new RegExp(`#"${escRe(ename)}"|(?<![A-Za-z0-9_])${escRe(ename)}(?![A-Za-z0-9_])`);
     if (re.test(mCode)) {
       const info = fromM(expressions[ename].sourceM);
@@ -3747,20 +3758,8 @@ function visualMatchesSearch(v, search) {
    Splits the original text first, then escapes each piece — so chars like &, <, > inside
    field names still match correctly. Returns safe HTML. */
 function highlightSearchMatches(text, search) {
-  const s = text || '';
-  if (!search) return esc(s);
-  const lower = s.toLowerCase();
-  const target = search.toLowerCase();
-  let out = '';
-  let i = 0;
-  while (i < s.length) {
-    const found = lower.indexOf(target, i);
-    if (found < 0) { out += esc(s.slice(i)); break; }
-    out += esc(s.slice(i, found));
-    out += `<mark style="background:#fff3a8;color:inherit;padding:0 1px;border-radius:2px">${esc(s.slice(found, found + search.length))}</mark>`;
-    i = found + search.length;
-  }
-  return out;
+  return markMatches(text, search,
+    '<mark style="background:#fff3a8;color:inherit;padding:0 1px;border-radius:2px">', '</mark>');
 }
 
 /* Update the active page selection without rebuilding the sidebar list, preserving
@@ -4023,7 +4022,7 @@ function renderNotes() {
       <li><strong>File loading:</strong> drag-drop a folder (uses <code>DataTransferItem.webkitGetAsEntry()</code>) or click "Load PBIP Folder" (uses <code>&lt;input type="file" webkitdirectory&gt;</code>).</li>
       <li><strong>Parsing:</strong> TMDL files are line-oriented + tab-indented; parsed in pure JS via regex + indent tracking. Report JSON is parsed via <code>JSON.parse</code> with recursive walk for stringified-inside-string config blocks.</li>
       <li><strong>State:</strong> kept in <code>App.state</code> (tables, expressions, relationships, sources, pages, usage, etc.). Re-renders on tab switch or toggle change.</li>
-      <li><strong>Network calls:</strong> only one — Google Fonts stylesheet at page load. No data ever leaves the browser. See the "Is it offline-safe?" note at the bottom.</li>
+      <li><strong>Network calls:</strong> none. Nothing is fetched at page load and no data ever leaves the browser. See the "Is it offline-safe?" note at the bottom.</li>
     </ul>
 
     <h2>2. File structure it reads</h2>
@@ -4311,7 +4310,7 @@ function renderNotes() {
       <li><strong>Top-right controls:</strong> "Fit" (resets zoom transform to 1×, smoothly animated) and "Reset" (rebuilds the graph from scratch — useful if you've dragged things around)</li>
     </ul>
     <div class="notes-callout info">
-      <strong>D3 is the only third-party code in this file.</strong> It's bundled inline (not loaded from a CDN), so the page stays offline-safe — no network calls beyond the Google Fonts stylesheet at page load. If you want to remove D3, the relationships graph would need to be reverted to the vanilla force-directed implementation (~150 lines of code) — the rest of the app is dep-free and unaffected.
+      <strong>D3 is the only third-party code in this file.</strong> It's bundled inline (not loaded from a CDN), so the page stays offline-safe — it makes no network calls at all. If you want to remove D3, the relationships graph would need to be reverted to the vanilla force-directed implementation (~150 lines of code) — the rest of the app is dep-free and unaffected.
     </div>
 
     <h2>11. Report parsing (Pages tab)</h2>
@@ -4357,10 +4356,10 @@ function renderNotes() {
     <h2>14. Is it offline-safe?</h2>
     <ul>
       <li><strong>D3 v7 is embedded inline</strong> in the file (~280 KB inside a <code>&lt;script&gt;</code> block at the top) — no CDN call needed at runtime.</li>
-      <li>Only network call on page load: <code>https://fonts.googleapis.com/css2?...</code> — fonts only, no data. Falls back to system fonts if blocked.</li>
+      <li><strong>No webfont is fetched.</strong> Typography resolves against locally installed families (Source Sans 3 / JetBrains Mono) and falls back to the platform UI and mono faces, so the page makes <em>zero</em> network requests.</li>
       <li>All PBIP file content is read by the browser's File API, processed in memory, and discarded when the tab closes. <strong>No uploads, no <code>fetch</code>, no <code>XHR</code>, no <code>localStorage</code>, no cookies.</strong></li>
       <li>The "Upload files" prompt the browser shows when you pick a folder is browser jargon for "let this page READ these files" — nothing is transmitted.</li>
-      <li>To make it 100% network-free, remove the Google Fonts <code>&lt;link&gt;</code> in <code>&lt;head&gt;</code> and the page falls back to system sans-serif. (D3 is already in the file, so it needs no network.)</li>
+      <li>The file is therefore network-free as shipped: open it from a USB stick, an email attachment, or an air-gapped machine and it behaves identically.</li>
     </ul>
 
     <h2>15. How to extend</h2>
@@ -4453,6 +4452,27 @@ function esc(s) {
   const d = document.createElement('div');
   d.textContent = s == null ? '' : String(s);
   return d.innerHTML;
+}
+
+/* Escape `text` for HTML while wrapping every case-insensitive occurrence of `term`
+   in the given tags. The match must run over the RAW text and escape each slice
+   afterwards — escaping first and then matching breaks on any term containing an
+   HTML metacharacter, because e.g. `&` has already become `&amp;` by the time the
+   search runs and can never match. */
+function markMatches(text, term, openTag, closeTag) {
+  const s = text == null ? '' : String(text);
+  if (!term) return esc(s);
+  const hay = s.toLowerCase();
+  const needle = String(term).toLowerCase();
+  let out = '', i = 0;
+  for (;;) {
+    const found = hay.indexOf(needle, i);
+    if (found < 0) { out += esc(s.slice(i)); break; }
+    out += esc(s.slice(i, found));
+    out += openTag + esc(s.slice(found, found + needle.length)) + closeTag;
+    i = found + needle.length;
+  }
+  return out;
 }
 
 /* ── M code helpers — inline data extraction & SQL extraction ── */
@@ -4932,10 +4952,7 @@ function measureItemClassFor(key) {
   return '';
 }
 function highlight(text, term) {
-  const safe = esc(text);
-  if (!term) return safe;
-  const re = new RegExp('(' + escRe(term) + ')', 'gi');
-  return safe.replace(re, '<span class="mark">$1</span>');
+  return markMatches(text, term, '<span class="mark">', '</span>');
 }
 function showToast(msg, type) {
   const t = document.createElement('div');
