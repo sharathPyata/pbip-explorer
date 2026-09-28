@@ -4006,7 +4006,7 @@ function renderTableDetail() {
         <div class="detail-meta-item"><span class="dot purple"></span> ${t.measures.length} measures</div>
         ${t.hierarchies.length ? `<div class="detail-meta-item"><span class="dot yellow"></span> ${t.hierarchies.length} hierarch${t.hierarchies.length===1?'y':'ies'}</div>` : ''}
         ${t.calcItems && t.calcItems.length ? `<div class="detail-meta-item"><span class="dot purple"></span> ${t.calcItems.length} calc items</div>` : ''}
-        ${t.calcGroupPrecedence != null ? `<div class="detail-meta-item"><span class="dot yellow"></span> precedence: <code>${t.calcGroupPrecedence}</code></div>` : ''}
+        ${t.calcGroupPrecedence != null ? `<div class="detail-meta-item"><span class="dot yellow"></span> precedence: <code>${esc(t.calcGroupPrecedence)}</code></div>` : ''}
         ${(kind === 'auto-date' || kind === 'date-template') && autoDateSourceFor(t.name) ? `<div class="detail-meta-item" style="background:var(--purple-light);padding:3px 8px;border-radius:4px"><span style="color:var(--purple);font-weight:600">Generated for</span> <span style="font-family:var(--mono)">${esc(autoDateSourceFor(t.name))}</span></div>` : ''}
         <div class="detail-meta-item"><span class="dot green"></span> mode: <code>${esc(t.mode)}</code></div>
       </div>
@@ -4087,7 +4087,7 @@ function renderTableDetail() {
         ${t.calcItems.map(ci => `
           <div class="measure-item">
             <div class="measure-head">
-              <div class="measure-name">${esc(ci.name)}${ci.ordinal != null ? ` <span class="measure-folder" style="background:var(--bg-3);color:var(--text-2);border:1px solid var(--border)">#${ci.ordinal}</span>` : ''}</div>
+              <div class="measure-name">${esc(ci.name)}${ci.ordinal != null ? ` <span class="measure-folder" style="background:var(--bg-3);color:var(--text-2);border:1px solid var(--border)">#${esc(ci.ordinal)}</span>` : ''}</div>
             </div>
             <pre class="measure-dax">${esc(ci.dax)}</pre>
             ${ci.formatStringDefinition ? `<div style="margin-top:6px"><div style="font-size:10px;font-weight:600;color:var(--text-2);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:4px">Format String Definition</div><pre class="measure-dax" style="border-left:3px solid var(--yellow-accent,#c49000)">${esc(ci.formatStringDefinition)}</pre></div>` : ''}
@@ -4118,7 +4118,7 @@ function renderTableDetail() {
 
     ${t.partitionSource ? `
     <div class="subsection">
-      <div class="subsection-header open"><span class="arrow">▶</span>${partitionLabel} <span class="pill">${t.mode}</span></div>
+      <div class="subsection-header open"><span class="arrow">▶</span>${partitionLabel} <span class="pill">${esc(t.mode)}</span></div>
       <div class="subsection-body">
         <pre class="m-code">${esc(t.partitionSource)}</pre>
       </div>
@@ -4725,7 +4725,7 @@ function visualRowHtml(v, groupsById, search, bookmark) {
       </div>
       ${pill}
       ${group ? `<span class="visual-group">▣ ${esc(group.name || group.id)}</span>` : ''}
-      <span style="font-family:var(--mono);font-size:10px;color:var(--text-3);white-space:nowrap" title="x,y · width × height${v.z ? ' (z=' + v.z + ')' : ''}${v.tabOrder != null ? ' (tab=' + v.tabOrder + ')' : ''}">
+      <span style="font-family:var(--mono);font-size:10px;color:var(--text-3);white-space:nowrap" title="x,y · width × height${v.z ? ' (z=' + v.z + ')' : ''}${v.tabOrder != null ? ' (tab=' + esc(v.tabOrder) + ')' : ''}">
         ${v.x},${v.y} · ${v.width}×${v.height}
       </span>
     </div>`;
@@ -5434,10 +5434,15 @@ function runGlobalSearch() {
 /* ═══════════════════════════════════════════════════════════════
    HELPERS
    ═══════════════════════════════════════════════════════════════ */
+/* HTML-escape text for element content AND attribute values. The quote escapes are the point:
+   this file puts esc() output inside attr="…" throughout (data-name, data-table, data-copy-sql,
+   title, value), and the old version — a DOM text node's innerHTML — escapes only & < >. A name or
+   SQL string holding a " ended its attribute early: the SQL Copy button copied a truncated query
+   (Snowflake SQL quotes every identifier), and a crafted PBIP could open new attributes such as
+   event handlers. ' is escaped too, so single-quoted attributes are safe as well. */
+const HTML_ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 function esc(s) {
-  const d = document.createElement('div');
-  d.textContent = s == null ? '' : String(s);
-  return d.innerHTML;
+  return (s == null ? '' : String(s)).replace(/[&<>"']/g, c => HTML_ESCAPES[c]);
 }
 
 /* Escape `text` for HTML while wrapping every case-insensitive occurrence of `term`
@@ -5783,8 +5788,9 @@ function extractFromRows(mCode) {
 function highlightSql(sql) {
   // Light syntax highlighting (HTML-escape first, then color keywords & strings)
   let out = esc(sql);
-  // Single-quoted strings
-  out = out.replace(/('(?:[^']|'')*')/g, '<span style="color:#22863a">$1</span>');
+  // Single-quoted strings — esc() has turned their quotes into &#39;. A doubled '' escape splits
+  // into adjacent spans of the same colour, which reads the same.
+  out = out.replace(/(&#39;[\s\S]*?&#39;)/g, '<span style="color:#22863a">$1</span>');
   // Line comments and block comments
   out = out.replace(/(--[^\n]*)/g, '<span style="color:#6a737d;font-style:italic">$1</span>');
   out = out.replace(/(\/\*[\s\S]*?\*\/)/g, '<span style="color:#6a737d;font-style:italic">$1</span>');

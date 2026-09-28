@@ -16,8 +16,9 @@ function appSource(htmlPath) {
   return m[1].replace(/\binit\(\);\s*$/, '');
 }
 
-/* Just enough DOM for processFiles(): esc() (text in, escaped HTML out), toasts, and the App.els
-   elements it writes counts and rendered HTML into. */
+/* Just enough DOM for processFiles(): toasts, the App.els elements it writes counts and rendered
+   HTML into, and createElement's text-in / escaped-HTML-out innerHTML, which older copies of the
+   page (before esc() became a plain string function) rely on when run.js is pointed at them. */
 function domGlobals(toasts) {
   const element = () => ({
     style: {}, dataset: {}, _text: '', _html: '',
@@ -44,8 +45,9 @@ function domGlobals(toasts) {
 
 /* Load the app and return the named top-level functions and constants — undefined when one
    doesn't exist, so a test reports "not defined" rather than crashing the run. With { dom: true }
-   the DOM stubs above are installed and `toasts` collects every toast message. The file loaded is
-   pbip-explorer.html unless PBIP_HTML (set by run.js from its argument) names another. */
+   the DOM stubs above are installed, `toasts` collects every toast message, and `document` /
+   `element` are exposed so a test can hand a render function its target element. The file loaded
+   is pbip-explorer.html unless PBIP_HTML (set by run.js from its argument) names another. */
 function loadApp(names, { dom = false } = {}) {
   const htmlPath = process.env.PBIP_HTML || DEFAULT_HTML;
   const toasts = [];
@@ -58,6 +60,7 @@ function loadApp(names, { dom = false } = {}) {
   const app = ctx.__app;
   if (stubs && app.App) app.App.els = new Proxy({}, { get: (t, k) => t[k] || (t[k] = stubs.element()) });
   app.toasts = toasts;
+  if (stubs) { app.document = stubs.document; app.element = stubs.element; }
   return app;
 }
 
