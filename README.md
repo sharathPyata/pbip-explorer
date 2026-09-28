@@ -197,6 +197,24 @@ This means you can drop a PBIP that contains internal SQL, schema names, or sens
 
 ---
 
+## Tests
+
+The parsers, usage analysis and export have a test suite that needs nothing but Node — no `npm install` (tested with Node 20):
+
+```bash
+node tests/run.js
+```
+
+It loads the app's own `<script>` from `pbip-explorer.html` into Node and runs every `tests/*.test.js`: the Unused-tab reference rules, report pages / visuals / bookmarks in both report formats, and a small project loaded end to end in both model formats. Fixtures mirror real PBIP files.
+
+To check that a new test really fails without a fix, point the runner at an older copy of the page:
+
+```bash
+git show HEAD~1:pbip-explorer.html > /tmp/before.html && node tests/run.js /tmp/before.html
+```
+
+---
+
 ## Credits & licences
 
 PBIP Explorer itself is MIT-licensed (see [LICENSE](LICENSE)). Three third-party assets are bundled inline:
