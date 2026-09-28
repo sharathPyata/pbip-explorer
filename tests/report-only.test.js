@@ -8,7 +8,7 @@
 const { loadApp, fileList, eq, has, hasNot, defined, suite } = require('./harness');
 const { tests, test } = suite();
 
-const NAMES = ['App', 'processFiles', 'pickProject', 'buildMarkdownExport', 'reportFieldsUsed',
+const NAMES = ['App', 'processFiles', 'pickProject', 'buildMarkdownExport', 'reportFieldsUsed', 'usageStatus',
   'renderOverview', 'renderSources', 'renderTables', 'renderRelationships', 'renderMeasures', 'renderUnused', 'updateCounts'];
 const pos = { x: 0, y: 0, width: 10, height: 10 };
 const col = (entity, prop) => ({ Column: { Expression: { SourceRef: { Entity: entity } }, Property: prop } });
@@ -67,6 +67,24 @@ test('fields the report uses: visuals, filters and report-measure DAX — its ow
     ['Costs', 'Total Cost', 1, false, []],
     ['Product', 'Category', 1, false, []],
   ], 'fields');
+});
+
+test('a stale queryRef: Fields used lists the bound field, not the stale name; with the model, the name still counts', async () => {
+  const measure = (prop) => ({ Measure: { Expression: { SourceRef: { Entity: 'fca' } }, Property: prop } });
+  const files = { ...thinPbir };
+  files['ws/Cost.Report/definition/pages/p1/visuals/v1/visual.json'] = { name: 'v1', position: pos, visual: { visualType: 'card',
+    query: { queryState: { Values: { projections: [{ field: measure('#TotalCost'), queryRef: 'fca.$TCO', nativeQueryRef: '$TCO' }] } } } } };
+  const app = await load(files);
+  const fields = app.reportFieldsUsed().map(f => [`${f.table}.${f.field}`, f.visuals]);
+  has(JSON.stringify(fields), '["fca.#TotalCost",1]');
+  hasNot(JSON.stringify(fields), '$TCO');
+
+  // Paired with a model that still has the old measure too: marking it used is the safe side.
+  files['ws/Cost.Report/definition.pbir'] = { version: '4.0', datasetReference: { byPath: { path: '../Cost.SemanticModel' } } };
+  files['ws/Cost.SemanticModel/definition/model.tmdl'] = 'model Model\n';
+  files['ws/Cost.SemanticModel/definition/tables/fca.tmdl'] = 'table fca\n\tmeasure \'#TotalCost\' = 1\n\tmeasure \'$TCO\' = 2\n\tmeasure Spare = 3\n';
+  const paired = await load(files);
+  eq(['fca.#TotalCost', 'fca.$TCO', 'fca.Spare'].map(paired.usageStatus), ['used', 'used', 'unused'], 'usage');
 });
 
 test('legacy thin report: modelExtensions measures, version-1 connection (pbiModelDatabaseName)', async () => {

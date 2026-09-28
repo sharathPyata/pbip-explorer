@@ -111,6 +111,45 @@ test('PBIR: literal title (escaped quote), textbox text', async () => {
   eq([byId.a.title, byId.c.text, byId.d.title], ['Year Slicer', 'MyCompany - Cost Analysis', "Margin | by 'Category'"], 'titles');
 });
 
+// ── Stale queryRefs ────────────────────────────────────────────────────────────────────
+// A projection's queryRef is only the visual's name for its field, and it goes stale; the query
+// expression is what's bound. Shapes from microsoft/fabric-toolbox's FCA_Core_Report, where 12
+// of 152 projections disagree.
+const M = (entity, prop) => ({ Measure: { Expression: { SourceRef: { Entity: entity } }, Property: prop } });
+const C = (entity, prop) => ({ Column: { Expression: { SourceRef: { Entity: entity } }, Property: prop } });
+const staleRoot = 's.Report/definition/pages';
+const staleByPath = Object.fromEntries(Object.entries({
+  [`${staleRoot}/pages.json`]: { pageOrder: ['p'] },
+  [`${staleRoot}/p/page.json`]: { name: 'p', displayName: 'P' },
+  [`${staleRoot}/p/visuals/v/visual.json`]: { name: 'v', position: pos, visual: { visualType: 'pivotTable', query: { queryState: {
+    Values: { projections: [
+      { field: M('fca', '#TotalCost'), queryRef: 'fca.$TCO' },                            // renamed after it was bound
+      { field: M('quota_fabric', 'Quota Limit'), queryRef: 'quota_fabric.Quota Limit1' },  // bound twice
+      { field: { SparklineData: { Measure: M('fca', '#TotalCost'), Groupings: [C('calendar', 'Date')] } }, queryRef: 'SparklineData(fca.#TotalCost_[calendar.Date])' },
+      { field: { Aggregation: { Expression: C('capacity_regions', 'RegionName'), Function: 3 } }, queryRef: 'Min(capacity_regions.RegionName)' },
+    ] },
+    Rows: { projections: [{ field: { HierarchyLevel: { Expression: { Hierarchy: { Expression: { SourceRef: { Entity: 'calendar' } }, Hierarchy: 'Fiscal' } }, Level: 'Year' } },
+      queryRef: 'calendar.Fiscal.Year' }] },
+  } } } },
+}).map(([k, v]) => [k, { text: async () => JSON.stringify(v) }]));
+
+test('PBIR: a stale queryRef gives way to the bound field; consistent ones (aggregations, hierarchy levels) are kept', async () => {
+  const [p] = (await X.parsePbirReport(staleByPath, staleRoot)).pages;
+  eq(p.visuals[0].fields.map(f => f.ref),
+    ['fca.#TotalCost', 'quota_fabric.Quota Limit', 'SparklineData(fca.#TotalCost)', 'Min(capacity_regions.RegionName)', 'calendar.Fiscal.Year'], 'refs');
+});
+
+test("legacy: a stale queryRef gives way to its Select item's field (alias resolved through From)", () => {
+  const text = JSON.stringify({ config: '{}', sections: [{ name: 's', displayName: 'S', config: '{}', visualContainers: [
+    vc({ name: 'v', singleVisual: { visualType: 'card', projections: { Values: [{ queryRef: 'fca.$TCO' }, { queryRef: 'Sum(Sales.Amount)' }, { queryRef: 'Sales.NoSelect' }] },
+      prototypeQuery: { Version: 2, From: [{ Name: 'f', Entity: 'fca', Type: 0 }, { Name: 's', Entity: 'Sales', Type: 0 }], Select: [
+        { Measure: { Expression: { SourceRef: { Source: 'f' } }, Property: '#TotalCost' }, Name: 'fca.$TCO' },
+        { Aggregation: { Expression: { Column: { Expression: { SourceRef: { Source: 's' } }, Property: 'Amount' } }, Function: 0 }, Name: 'Sum(Sales.Amount)' },
+      ] } } }),
+  ] }] });
+  eq(X.parseReport(text)[0].visuals[0].fields.map(f => f.ref), ['fca.#TotalCost', 'Sum(Sales.Amount)', 'Sales.NoSelect'], 'refs');
+});
+
 // ── Labels & hidden state ──────────────────────────────────────────────────────────────
 test('label precedence: title > dynamic title > text > auto', () => {
   const L = defined(X.visualLabel, 'visualLabel');

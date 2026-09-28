@@ -2172,8 +2172,13 @@ function parseDaxReferences(dax, homeTable) {
   String-embedded JSON: report.json has stringified JSON in many fields (config,
   filters, dataTransforms). The walker parses these recursively to find references
   inside.
+
+  Patterns 6 and 7 are names, not bindings, and a name can be stale — a measure renamed
+  after a visual bound it keeps its old queryRef (see projectionRef). They count toward
+  usage anyway: a stale name matches nothing, and marking too much is the safe side. When
+  `structured` is given, the references found through patterns 1–5 alone are added to it too.
 */
-function extractAllReportReferences(report) {
+function extractAllReportReferences(report, structured) {
   // Accepts either a JSON string (legacy report.json) or an already-parsed object
   // (PBIR, where each visual.json / page.json is parsed individually — see parsePbirReport).
   const refs = new Set();
@@ -2193,6 +2198,8 @@ function extractAllReportReferences(report) {
     return null;
   }
 
+  const bound = (r) => { refs.add(r); if (structured) structured.add(r); };
+
   function visit(node, sourceMap) {
     if (Array.isArray(node)) { for (const item of node) visit(item, sourceMap); return; }
     if (!node || typeof node !== 'object') return;
@@ -2208,20 +2215,20 @@ function extractAllReportReferences(report) {
     if (node.Property && typeof node.Property === 'string' &&
         node.Expression && node.Expression.SourceRef) {
       const ent = resolveEntity(node.Expression.SourceRef, scopeMap);
-      if (ent) refs.add(`${ent}.${node.Property}`);
+      if (ent) bound(`${ent}.${node.Property}`);
     }
 
     // Pattern 2: Direct { Property, Entity } pair (rare but legal)
     if (node.Property && typeof node.Property === 'string' &&
         node.Entity && typeof node.Entity === 'string') {
-      refs.add(`${node.Entity}.${node.Property}`);
+      bound(`${node.Entity}.${node.Property}`);
     }
 
     // Pattern 3: Hierarchy reference (treat the hierarchy as a field on the table)
     if (typeof node.Hierarchy === 'string' &&
         node.Expression && node.Expression.SourceRef) {
       const ent = resolveEntity(node.Expression.SourceRef, scopeMap);
-      if (ent) refs.add(`${ent}.${node.Hierarchy}`);
+      if (ent) bound(`${ent}.${node.Hierarchy}`);
     }
 
     // Pattern 4: HierarchyLevel { Level, Expression: { Hierarchy: { Expression: { SourceRef }, Hierarchy } } }
@@ -2231,7 +2238,7 @@ function extractAllReportReferences(report) {
       const ent = resolveEntity(node.Expression.Hierarchy.Expression.SourceRef, scopeMap);
       if (ent) {
         const hname = node.Expression.Hierarchy.Hierarchy;
-        if (hname) refs.add(`${ent}.${hname}`);
+        if (hname) bound(`${ent}.${hname}`);
       }
     }
 
@@ -2240,7 +2247,7 @@ function extractAllReportReferences(report) {
       const pvs = node.PropertyVariationSource;
       if (pvs.Property && pvs.Expression && pvs.Expression.SourceRef) {
         const ent = resolveEntity(pvs.Expression.SourceRef, scopeMap);
-        if (ent) refs.add(`${ent}.${pvs.Property}`);
+        if (ent) bound(`${ent}.${pvs.Property}`);
       }
     }
 
@@ -2618,11 +2625,17 @@ function parseReport(text) {
       }
       const singleVisual = cfg.singleVisual || {};
       const type = singleVisual.visualType || 'unknown';
+      // A projection's queryRef is the Name of a Select item in the visual's query, which holds
+      // the field actually bound — the queryRef itself can be stale (see projectionRef).
       const fields = [];
       const projections = singleVisual.projections || {};
+      const query = singleVisual.prototypeQuery || {};
+      const alias = {}, selected = {};
+      for (const f of (query.From || [])) if (f && f.Name && f.Entity) alias[f.Name] = f.Entity;
+      for (const sel of (query.Select || [])) if (sel && sel.Name) selected[sel.Name] = sel;
       for (const role of Object.keys(projections)) {
         for (const p of projections[role] || []) {
-          if (p.queryRef) fields.push({ role, ref: p.queryRef });
+          if (p.queryRef) fields.push({ role, ref: projectionRef(p.queryRef, projectionFieldRef(selected[p.queryRef], alias)) });
         }
       }
       // Position can be in two places depending on PBI version:
@@ -2800,9 +2813,9 @@ async function parsePbirReport(byPath, pagesRoot) {
   //    valid JSON, so a single JSON.parse would fail and silently return zero references
   //    (which would falsely flag fields used only in filters / sort / conditional formatting
   //    as "unused"). Passing each already-parsed object individually is the correct approach.
-  const references = new Set();
+  const references = new Set(), fieldRefs = new Set();
   for (const obj of allJson) {
-    for (const r of extractAllReportReferences(obj)) references.add(r);
+    for (const r of extractAllReportReferences(obj, fieldRefs)) references.add(r);
   }
   // Report-level measure DAX references model objects by name, which the JSON walker above
   // can't see — it's an expression string, not a structured binding.
@@ -2825,7 +2838,7 @@ async function parsePbirReport(byPath, pagesRoot) {
   for (const b of bookmarks) if (folderOf[b.id]) b.folder = folderOf[b.id];
   const rank = (b) => { const i = order.indexOf(b.id); return i < 0 ? 1e9 : i; };
   bookmarks.sort((a, b) => rank(a) - rank(b));
-  return { pages, references, reportMeasures, bookmarks };
+  return { pages, references, fieldRefs, reportMeasures, bookmarks };
 }
 
 /* Parse a single PBIR visual.json into the same shape parseReport's visuals use. */
@@ -2842,13 +2855,13 @@ function parsePbirVisual(vJson) {
   const height = Math.round(pos.height || 0);
   const tabOrder = pos.tabOrder ?? null;
 
-  // Field bindings: visual.query.queryState.[roleName].projections[].queryRef
+  // Field bindings: visual.query.queryState.[roleName].projections[] — field, and its queryRef
   const fields = [];
   const queryState = (visual.query && visual.query.queryState) || {};
   for (const role of Object.keys(queryState)) {
     const projections = (queryState[role] && queryState[role].projections) || [];
     for (const p of projections) {
-      const ref = p.queryRef || p.nativeQueryRef || pbirFieldToRef(p.field);
+      const ref = projectionRef(p.queryRef, projectionFieldRef(p.field)) || p.nativeQueryRef || pbirFieldToRef(p.field);
       // name: what the visual calls the field (a rename, else e.g. "Sum of Quantity"), used by
       // the auto label the way Power BI's default title uses it.
       if (ref) fields.push({ role, ref, name: p.displayName || p.nativeQueryRef || '' });
@@ -2894,6 +2907,32 @@ function pbirFieldToRef(field) {
     return null;
   };
   return visit(field) || '';
+}
+
+/* The Column or Measure a projection binds — bare, aggregated, or a sparkline's measure — as
+   "Table.Field", read from its query expression (a legacy query's Source alias resolved through
+   `alias`); '' for anything else, such as a hierarchy level, whose queryRef says more. */
+function projectionFieldRef(expr, alias) {
+  let e = expr && typeof expr === 'object' ? expr : {};
+  if (e.Aggregation) e = e.Aggregation.Expression || {};
+  else if (e.SparklineData) e = e.SparklineData.Measure || {};
+  const f = e.Column || e.Measure;
+  const src = f && f.Expression && f.Expression.SourceRef;
+  const ent = src && (src.Entity || (alias && alias[src.Source]));
+  return ent && typeof f.Property === 'string' ? `${ent}.${f.Property}` : '';
+}
+
+/* A projection's field: its queryRef — the visual's own name for it, which also shows an
+   aggregation ("Sum(Sales.Amount)") — unless that names another field than the query binds.
+   queryRefs go stale: a measure renamed after it was bound keeps its old one (fca.$TCO for
+   fca.#TotalCost in microsoft/fabric-toolbox's FCA report), a field bound twice gets a numbered
+   one (quota_fabric.Quota Limit1), and a sparkline's is a name made up from two fields. The
+   bound field then stands in, inside the queryRef's wrapper if it has one. */
+function projectionRef(queryRef, bound) {
+  const named = queryRef ? parseQueryRef(queryRef) : null;
+  if (!bound || (named && `${named.table}.${named.field}` === bound)) return queryRef || bound;
+  const wrapper = String(queryRef || '').match(/^([A-Za-z_]\w*)\(/);
+  return wrapper ? `${wrapper[1]}(${bound})` : bound;
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -3426,7 +3465,8 @@ function daxQualifiedRefs(dax) {
    referenced by a filter, bookmark or other setting, or by a report-level measure's DAX — as
    [{ table, field, visuals, other, measures }]. The report's own measures are defined in the report,
    not the model, so they're left out. This is what the Unused tab can't give without the model:
-   what the shared model must keep for this report to work. */
+   what the shared model must keep for this report to work. Only bindings count, not queryRef
+   names: with no model to match them against, a stale name would be listed as a field. */
 function reportFieldsUsed() {
   const s = App.state, fields = new Map();
   const entry = (table, field) => {
@@ -3445,7 +3485,7 @@ function reportFieldsUsed() {
       }
     }
   }
-  for (const ref of (s.reportReferences || [])) {
+  for (const ref of (s.reportFieldRefs || [])) {
     const r = parseQueryRef(ref);
     if (r) { const e = entry(r.table, r.field); if (!e.visuals) e.other = true; }
   }
@@ -3689,20 +3729,21 @@ function parseLegacyReportMeasures(reportText) {
 async function parseReportFolder(byPath, report) {
   if (report.pagesRoot) {
     const r = await parsePbirReport(byPath, report.pagesRoot);
-    return { pages: r.pages, references: r.references, reportMeasures: r.reportMeasures || [], bookmarks: r.bookmarks || [] };
+    return { pages: r.pages, references: r.references, fieldRefs: r.fieldRefs, reportMeasures: r.reportMeasures || [], bookmarks: r.bookmarks || [] };
   }
   if (report.legacyKey) {
     const text = await byPath[report.legacyKey].text();
-    const references = extractAllReportReferences(text);
+    const fieldRefs = new Set();
+    const references = extractAllReportReferences(text, fieldRefs);
     const reportMeasures = parseLegacyReportMeasures(text);
     // As for PBIR: a report measure's DAX is an expression string the JSON walker can't see into.
     for (const rm of reportMeasures) {
       const { columns, measures } = parseDaxReferences(rm.dax, rm.table);
       for (const r of [...columns, ...measures]) references.add(r);
     }
-    return { pages: parseReport(text), references, reportMeasures, bookmarks: parseLegacyBookmarks(text) };
+    return { pages: parseReport(text), references, fieldRefs, reportMeasures, bookmarks: parseLegacyBookmarks(text) };
   }
-  return { pages: [], references: new Set(), reportMeasures: [], bookmarks: [] };
+  return { pages: [], references: new Set(), fieldRefs: new Set(), reportMeasures: [], bookmarks: [] };
 }
 
 /* A report whose model isn't in the project: live-connected (byConnection), or a byPath folder that
@@ -3717,7 +3758,7 @@ async function loadReportOnly(byPath, report) {
       tables: [], expressions: {}, relationships: [], sources: [], modelAnnotations: {}, functions: [], roles: [], perspectives: [],
     });
     const res = await parseReportFolder(byPath, report);
-    Object.assign(App.state, { pages: res.pages, reportReferences: res.references, reportMeasures: res.reportMeasures, bookmarks: res.bookmarks, pageBookmark: {} });
+    Object.assign(App.state, { pages: res.pages, reportReferences: res.references, reportFieldRefs: res.fieldRefs, reportMeasures: res.reportMeasures, bookmarks: res.bookmarks, pageBookmark: {} });
     buildUsageIndex();
     App.els.emptyState.classList.add('hidden');
     App.els.projectName.textContent = report.name;
@@ -5441,7 +5482,7 @@ function renderNotes() {
     <ul>
       <li><strong>By their files, not folder names.</strong> A model is any folder holding <code>definition/model.tmdl</code> (TMDL) or <code>model.bim</code> (TMSL) — named <code>X.SemanticModel</code>, <code>X.Dataset</code> (older projects; microsoft/finops-toolkit still ships them) or anything else, as Fabric Git exports can be. A report is any folder holding <code>definition.pbir</code>, or a <code>*.Report</code> folder with <code>report.json</code> / <code>definition/pages/</code>.</li>
       <li><strong>Paired by the report's own link.</strong> <code>definition.pbir</code> → <code>datasetReference.byPath.path</code> is resolved relative to the report folder (<code>..</code> climbs; matched case-insensitively, as Windows paths are). Only <code>definition.pbir</code> counts; alternates such as <code>definition-liveConnect.pbir</code> are ignored, as Fabric Git ignores them. A report without a <code>definition.pbir</code> pairs with the folder's only model. A live connection (<code>byConnection</code>) names its model in the connection string's <code>initial catalog</code>; Fabric Git writes one even when that model is in the same export (microsoft/fabric-toolbox's <code>FCA_Core_Report</code> → <code>FCA_Core_SM</code>), so the report pairs with the model here of that name — its folder's, or the <code>displayName</code> in its <code>.platform</code> — when exactly one matches. The Overview then says the report is live-connected and was paired by name.</li>
-      <li><strong>A report whose model isn't here opens on its own.</strong> Live-connected to a model in the service, or a <code>byPath</code> model folder that wasn't dropped: its pages, visuals, bookmarks and report-level measures all load. The Overview shows the connection (workspace, model, semantic model ID from <code>semanticmodelid</code> or <code>pbiModelDatabaseName</code>); Sources, Tables and Relationships say where the model is; Measures lists the report's own measures; and Unused becomes <strong>Fields used</strong> — every model field the report depends on. The export follows suit.</li>
+      <li><strong>A report whose model isn't here opens on its own.</strong> Live-connected to a model in the service, or a <code>byPath</code> model folder that wasn't dropped: its pages, visuals, bookmarks and report-level measures all load. The Overview shows the connection (workspace, model, semantic model ID from <code>semanticmodelid</code> or <code>pbiModelDatabaseName</code>); Sources, Tables and Relationships say where the model is; Measures lists the report's own measures; and Unused becomes <strong>Fields used</strong> — every model field the report depends on, from structured bindings only (a stale <code>queryRef</code> name, with no model to check it against, would be listed as a field that doesn't exist). The export follows suit.</li>
       <li><strong>One project loads straight away; several always ask.</strong> The picker lists every model shared by several reports as <em>All N reports on Model</em> first — pages from all of them, with each page's name prefixed by its report and field usage pooled, so the Unused tab means unused by every report — then each report with its model (the one a <code>.pbip</code> opens first), then models no report uses.</li>
     </ul>
 
@@ -5651,7 +5692,7 @@ function renderNotes() {
     <table>
       <thead><tr><th>Layer</th><th>Where found</th><th>Category</th></tr></thead>
       <tbody>
-        <tr><td>Visual field bindings (queryRef)</td><td><code>config.singleVisual.projections[role][].queryRef</code> — e.g. <code>"Sum(Sales.Sales)"</code>, <code>"FACT_TBM_A&amp;F.Investment Type"</code>. Parsed by <code>parseQueryRef</code>; supports table names with any non-dot characters (<code>&amp;</code>, hyphens, spaces, parens).</td><td>Direct</td></tr>
+        <tr><td>Visual field bindings (queryRef)</td><td><code>config.singleVisual.projections[role][].queryRef</code> — e.g. <code>"Sum(Sales.Sales)"</code>, <code>"FACT_TBM_A&amp;F.Investment Type"</code>. Parsed by <code>parseQueryRef</code>; supports table names with any non-dot characters (<code>&amp;</code>, hyphens, spaces, parens). A queryRef can be stale (see 11.2) and still counts: a stale name matches nothing, or an old field that's still there, which errs on the safe side.</td><td>Direct</td></tr>
         <tr><td>Visual binding (structured Column/Measure)</td><td><code>{ Property: "X", Expression: { SourceRef: { Entity | Source } } }</code> — resolved against the nearest <code>From</code> clause's <code>{Name → Entity}</code> map</td><td>Direct</td></tr>
         <tr><td>Hierarchy reference</td><td><code>{ Hierarchy: "H", Expression: { SourceRef: {...} } }</code></td><td>Direct</td></tr>
         <tr><td>HierarchyLevel reference</td><td><code>{ Level: "Year", Expression: { Hierarchy: { Expression: { SourceRef: {...} }, Hierarchy: "H" } } }</code> — the underlying hierarchy is marked used</td><td>Direct</td></tr>
@@ -5731,7 +5772,7 @@ function renderNotes() {
       <li>Reads <code>*.Report/report.json</code></li>
       <li>Walks <code>sections[]</code> → pages, each with <code>visualContainers[]</code> → visuals</li>
       <li>Visual type from <code>config.singleVisual.visualType</code> (config is stringified JSON, parsed on the fly)</li>
-      <li>Field bindings from <code>config.singleVisual.projections[role][].queryRef</code></li>
+      <li>Field bindings from <code>config.singleVisual.projections[role][].queryRef</code>, read through the <code>singleVisual.prototypeQuery</code> Select item of that <code>Name</code> (its <code>Source</code> alias resolved through the query's <code>From</code>): when the queryRef names another field than the item binds — a measure renamed after the visual was built keeps its old name there (Pensadero's <code>Casos.Total Muertes</code> binds <code>Casos.Muertes</code>) — the bound field is shown</li>
       <li>Report-level measures from <code>config.modelExtensions[].entities[].measures[]</code> — the legacy form of PBIR's <code>reportExtensions.json</code>, and how a live-connected report adds measures to a model it can't change</li>
       <li>Dimensions (width/height) extracted for display</li>
       <li>Page flags from the section's stringified <code>config</code>: <code>visibility: 1</code> = hidden in view mode, <code>type: 1</code> = tooltip page, <code>type: 2</code> = drillthrough. Some older drillthrough pages have no <code>type</code>, only a drillthrough filter (<code>howCreated: 5</code>); tooltip pages carry those too, so the filter alone isn't read as a kind.</li>
@@ -5742,7 +5783,7 @@ function renderNotes() {
       <li>Detected by the <code>*.Report/definition/pages/</code> folder — identified via <code>pages.json</code> OR any <code>[pageName]/page.json</code> under it, since <code>pages.json</code> is optional per the spec (PBIR is preferred when both formats coexist)</li>
       <li>Page order read from <code>pages.json → pageOrder[]</code>; if absent, all <code>[pageName]/page.json</code> files are discovered by scanning</li>
       <li>Per-page metadata from <code>[pageName]/page.json</code> — <code>name</code>, <code>displayName</code>, <code>width</code>, <code>height</code>, <code>visibility: "HiddenInViewMode"</code> (hidden) and <code>type</code> (<code>Drillthrough</code> / <code>Tooltip</code>). A <code>pageBinding</code> alone isn't read as a kind: real reports keep one on ordinary, visible pages.</li>
-      <li>Each visual lives at <code>[pageName]/visuals/[visualName]/visual.json</code> — ID from <code>name</code>, type from <code>visual.visualType</code>, position from <code>position.{x,y,z,width,height,tabOrder}</code>, field bindings from <code>visual.query.queryState.[role].projections[].queryRef</code> (falls back to walking <code>field</code> when <code>queryRef</code> is missing), hidden from <code>isHidden</code>, title from <code>visual.visualContainerObjects.title</code>, parent group from <code>parentGroupName</code>. A container declaring <code>visualGroup</code> is a group (name, <code>isHidden</code>), not a visual.</li>
+      <li>Each visual lives at <code>[pageName]/visuals/[visualName]/visual.json</code> — ID from <code>name</code>, type from <code>visual.visualType</code>, position from <code>position.{x,y,z,width,height,tabOrder}</code>, field bindings from <code>visual.query.queryState.[role].projections[]</code> — the <code>queryRef</code>, unless it names another field than the projection's <code>field</code> binds, and then the bound field (inside the queryRef's wrapper, e.g. <code>SparklineData(…)</code>). queryRefs go stale: a measure renamed or moved to another table after it was bound keeps its old one (<code>fca.$TCO</code> for <code>fca.#TotalCost</code> in microsoft/fabric-toolbox's FCA report; <code>Measure Table.Sales Amount</code> for <code>Sales.Sales Amount</code> in RuiRomano's demo), and a field bound twice gets a numbered one (<code>Quota Limit1</code>). A projection without a <code>queryRef</code> uses its <code>field</code>, hidden from <code>isHidden</code>, title from <code>visual.visualContainerObjects.title</code>, parent group from <code>parentGroupName</code>. A container declaring <code>visualGroup</code> is a group (name, <code>isHidden</code>), not a visual.</li>
       <li><strong>Bookmarks</strong> (both formats: PBIR <code>bookmarks/*.bookmark.json</code>, ordered and foldered by <code>bookmarks.json</code> whose folders list bookmark names; legacy <code>config.bookmarks</code>, folders holding the bookmark objects under <code>children</code>). A bookmark captures one page (<code>explorationState.activeSection</code>); its show/hide state is <code>sections[page].visualContainers[id].singleVisual.display.mode</code> (<code>"hidden"</code>, or absent for a captured visual that's shown) and <code>visualContainerGroups[id].isHidden</code> for groups, nested under <code>children</code>. <code>options.suppressDisplay</code> means it sets no visibility, <code>suppressData</code> no filters, and <code>applyOnlyToTargetVisuals</code> limits it to <code>targetVisualNames</code>. Confirmed against real show/hide bookmarks: FHSQLMonitor's filter panels toggle group state on selected visuals; comodu20's and Pensadero's legacy reports hide visuals directly.</li>
       <li>Each visual, page and report-level JSON file is parsed and passed <em>separately</em> through the same reference walker used for the legacy format (concatenated JSON documents wouldn't parse), so the Usage analyzer works identically across both</li>
     </ul>
