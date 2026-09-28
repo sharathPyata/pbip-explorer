@@ -963,6 +963,16 @@ tr.row-unused td:first-child { font-style: italic; }
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .visual-label-kind { font-size: 10px; font-weight: 400; font-style: italic; color: var(--text-3); margin-left: 6px; }
+.visual-item.untouched { opacity: .5; }
+.usage-pill.shown { background: var(--green-badge); color: var(--green-dark); border-color: #b7dcc2; }
+.page-bookmark-bar {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin: -6px 0 14px; font-size: 12px; color: var(--text-2);
+}
+.page-bookmark-bar select {
+  font-family: var(--sans); font-size: 12px; padding: 3px 6px; max-width: 360px;
+  border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--text);
+}
 .visual-group {
   font-family: var(--mono); font-size: 10px; color: var(--text-3);
   white-space: nowrap; max-width: 180px; overflow: hidden; text-overflow: ellipsis;
@@ -1186,6 +1196,8 @@ const App = {
     perspectives: [],     // [{name, members:[{kind, table, name}]}] from perspectives/*.tmdl
     functions: [],        // [{name, dax}] DAX user-defined functions from functions.tmdl
     reportMeasures: [],   // report-level measures from PBIR reportExtensions.json
+    bookmarks: [],        // [{id, name, folder, page, display, data, targets, visuals, groups}] — see normaliseBookmark
+    pageBookmark: {},     // Pages tab: page name → index of the bookmark being previewed
     activeView: 'overview',
     activeTable: null,
     activePage: null,
@@ -2736,12 +2748,15 @@ async function parsePbirReport(byPath, pagesRoot) {
     k === `${definitionRoot}/reportExtensions.json` ||
     (k.startsWith(`${definitionRoot}/bookmarks/`) && k.endsWith('.json')));
   const extraTexts = await Promise.all(extraKeys.map(k => byPath[k].text().catch(() => null)));
-  const reportMeasures = [];
+  const reportMeasures = [], bookmarks = [];
+  let bookmarksMeta = null;
   for (let i = 0; i < extraKeys.length; i++) {
     if (extraTexts[i] == null) continue;
     let j;
     try { j = JSON.parse(extraTexts[i]); } catch (e) { continue; }
     allJson.push(j);
+    if (extraKeys[i].endsWith('.bookmark.json')) { const b = normaliseBookmark(j); if (b) bookmarks.push(b); }
+    else if (extraKeys[i].endsWith('/bookmarks/bookmarks.json')) bookmarksMeta = j;
     // Report-level measures are real measures that live in the report, not the model. Their
     // DAX is the only place some model columns are referenced, so mine it for references
     // as well as surfacing the measures themselves.
@@ -2774,7 +2789,21 @@ async function parsePbirReport(byPath, pagesRoot) {
     for (const r of columns) references.add(r);
     for (const r of measures) references.add(r);
   }
-  return { pages, references, reportMeasures };
+  // bookmarks.json sets the order and the folders: each item is a bookmark's name, or a folder
+  // { displayName, children: [bookmark names] }. Bookmarks it doesn't list keep file order, last.
+  const order = [], folderOf = {};
+  for (const it of ((bookmarksMeta && bookmarksMeta.items) || [])) {
+    if (it && Array.isArray(it.children)) {
+      for (const c of it.children) {
+        const n = typeof c === 'string' ? c : (c && c.name);
+        if (n) { order.push(n); folderOf[n] = it.displayName || ''; }
+      }
+    } else if (it && it.name) order.push(it.name);
+  }
+  for (const b of bookmarks) if (folderOf[b.id]) b.folder = folderOf[b.id];
+  const rank = (b) => { const i = order.indexOf(b.id); return i < 0 ? 1e9 : i; };
+  bookmarks.sort((a, b) => rank(a) - rank(b));
+  return { pages, references, reportMeasures, bookmarks };
 }
 
 /* Parse a single PBIR visual.json into the same shape parseReport's visuals use. */
@@ -2843,6 +2872,95 @@ function pbirFieldToRef(field) {
     return null;
   };
   return visit(field) || '';
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   BOOKMARKS — per-bookmark show / hide
+   ═══════════════════════════════════════════════════════════════
+   Both formats store a bookmark as { name, displayName, options, explorationState }: PBIR one per
+   bookmarks/*.bookmark.json, legacy inside report.json's config.bookmarks. A bookmark captures one
+   page (explorationState.activeSection). Its show/hide state is
+   sections[page].visualContainers[visualId].singleVisual.display.mode — "hidden", or absent for a
+   captured visual that's shown — and, for groups, visualContainerGroups[groupId].isHidden, with
+   nested groups under `children`. Confirmed against real show/hide bookmarks: FHSQLMonitor toggles
+   its filter panels through group state on "selected visuals"; comodu20's and Pensadero's
+   legacy reports hide visuals directly. */
+
+/* One bookmark as { id, name, folder, page, display, data, targets, visuals, groups }. display /
+   data: whether applying it sets visibility / filters (options.suppressDisplay / suppressData).
+   targets: the only IDs it touches when it applies to selected visuals (applyOnlyToTargetVisuals),
+   else null. visuals / groups: the captured state, id → 'shown' | 'hidden'. */
+function normaliseBookmark(b, folder) {
+  if (!b || typeof b !== 'object') return null;
+  const opts = b.options || {};
+  const es = b.explorationState || {};
+  const sections = es.sections || {};
+  const page = es.activeSection || Object.keys(sections)[0] || '';
+  const sec = sections[page] || {};
+  const visuals = {};
+  for (const [id, st] of Object.entries(sec.visualContainers || {})) {
+    const mode = st && st.singleVisual && st.singleVisual.display && st.singleVisual.display.mode;
+    visuals[id] = mode === 'hidden' ? 'hidden' : 'shown';
+  }
+  const groups = {};
+  const walkGroups = (obj) => {
+    for (const [id, g] of Object.entries(obj || {})) {
+      if (g && typeof g.isHidden === 'boolean') groups[id] = g.isHidden ? 'hidden' : 'shown';
+      if (g && g.children) walkGroups(g.children);
+    }
+  };
+  walkGroups(sec.visualContainerGroups);
+  return {
+    id: b.name || '', name: b.displayName || b.name || 'Bookmark', folder: folder || '', page,
+    display: !opts.suppressDisplay, data: !opts.suppressData,
+    targets: opts.applyOnlyToTargetVisuals ? (opts.targetVisualNames || []) : null,
+    visuals, groups,
+  };
+}
+
+/* Legacy: report.json's stringified config.bookmarks — bookmark objects, or folders
+   { displayName, children: [bookmark objects] }. */
+function parseLegacyBookmarks(reportText) {
+  let cfg;
+  try {
+    const r = JSON.parse(reportText);
+    cfg = typeof r.config === 'string' ? JSON.parse(r.config) : (r.config || {});
+  } catch (e) { return []; }
+  const out = [];
+  for (const item of (cfg.bookmarks || [])) {
+    const inFolder = item && Array.isArray(item.children);
+    for (const b of (inFolder ? item.children : [item])) {
+      const n = normaliseBookmark(b, inFolder ? (item.displayName || '') : '');
+      if (n) out.push(n);
+    }
+  }
+  return out;
+}
+
+/* How applying `bookmark` leaves a visual or group: 'shown', 'hidden', 'via group' (an enclosing
+   group ends up hidden), or '' when the bookmark doesn't touch it — it doesn't capture display, the
+   item is outside its selected visuals, or the item didn't exist when it was captured — in which
+   case the item keeps whatever state it was in. A group the bookmark leaves alone keeps its
+   default, so a visual the bookmark shows inside a group that stays hidden is 'via group'. */
+function bookmarkState(bookmark, item, isGroup, groupsById) {
+  const own = (it, group) => {
+    if (!bookmark.display) return '';
+    if (bookmark.targets && !bookmark.targets.includes(it.id)) return '';
+    return (group ? bookmark.groups : bookmark.visuals)[it.id] || '';
+  };
+  const s = own(item, isGroup);
+  if (s === 'hidden') return 'hidden';
+  let hiddenByBookmark = false, hiddenByDefault = false;
+  const seen = new Set();
+  for (let g = groupsById.get(item.parentGroup); g && !seen.has(g.id); g = groupsById.get(g.parentGroup)) {
+    seen.add(g.id);
+    const gs = own(g, true);
+    if (gs === 'hidden') hiddenByBookmark = true;
+    else if (!gs && g.isHidden) hiddenByDefault = true;
+  }
+  if (hiddenByBookmark) return 'via group';
+  if (s === 'shown') return hiddenByDefault ? 'via group' : 'shown';
+  return '';
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -3465,20 +3583,24 @@ async function processFiles(fileList) {
   const legacyKey = Object.keys(byPath).find(k => /\.Report\/report\.json$/.test(k));
   if (pbirPagesRoot) {
     setLoadingText('Parsing report pages…');
-    const { pages, references, reportMeasures } = await parsePbirReport(byPath, pbirPagesRoot);
+    const { pages, references, reportMeasures, bookmarks } = await parsePbirReport(byPath, pbirPagesRoot);
     App.state.pages = pages;
     App.state.reportReferences = references;
     App.state.reportMeasures = reportMeasures || [];
+    App.state.bookmarks = bookmarks || [];
   } else if (legacyKey) {
     const text = await byPath[legacyKey].text();
     App.state.pages = parseReport(text);
     App.state.reportReferences = extractAllReportReferences(text);
     App.state.reportMeasures = [];
+    App.state.bookmarks = parseLegacyBookmarks(text);
   } else {
     App.state.pages = [];
     App.state.reportReferences = new Set();
     App.state.reportMeasures = [];
+    App.state.bookmarks = [];
   }
+  App.state.pageBookmark = {};
 
   // Roles and perspectives also reference model objects, and nothing else in the project
   // does. A column used only by an RLS filter, or a measure exposed only through a
@@ -4514,7 +4636,7 @@ function renderPages() {
                 <div class="pages-list-meta">
                   ${search
                     ? `<span class="${stat.matches>0?'m':'u'}">${stat.matches} match${stat.matches!==1?'es':''}</span> · <span class="v">${stat.total} visual${stat.total!==1?'s':''}</span>`
-                    : `<span class="v">${stat.total} visual${stat.total!==1?'s':''}</span>${unbound > 0 ? ` · <span class="u">${unbound} unbound</span>` : ''}`}${[p.hidden ? 'hidden' : '', (p.kind || '').toLowerCase()].filter(Boolean).map(f => ` · <span class="u">${esc(f)}</span>`).join('')}
+                    : `<span class="v">${stat.total} visual${stat.total!==1?'s':''}</span>${unbound > 0 ? ` · <span class="u">${unbound} unbound</span>` : ''}`}${[p.hidden ? 'hidden' : '', (p.kind || '').toLowerCase()].filter(Boolean).map(f => ` · <span class="u">${esc(f)}</span>`).join('')}${(() => { const n = (App.state.bookmarks || []).filter(b => b.page === p.name).length; return n ? ` · <span class="u">${n} bookmark${n === 1 ? '' : 's'}</span>` : ''; })()}
                 </div>
               </div>
             `;
@@ -4573,14 +4695,27 @@ function pageFlagsHtml(p) {
 }
 
 /* One visual row: type, label (title, dynamic title, textbox text or auto label), field
-   bindings, hidden state and group. Shared by the All Pages and single-page views. Only the ID
-   goes into an attribute (PBIR names are word characters or hyphens; legacy ones are hex). */
-function visualRowHtml(v, groupsById, search) {
+   bindings, hidden state and group. Shared by the All Pages and single-page views. With a
+   `bookmark`, the pill shows what that bookmark does to the visual, and a visual it doesn't
+   touch is faded. Only the ID goes into an attribute (PBIR names are word characters or
+   hyphens; legacy ones are hex). */
+function visualRowHtml(v, groupsById, search, bookmark) {
   const { text, kind } = visualLabel(v);
-  const hidden = hiddenState(v, groupsById);
   const group = groupsById.get(v.parentGroup);
+  let pill = '', untouched = false;
+  if (bookmark) {
+    const st = bookmarkState(bookmark, v, false, groupsById);
+    untouched = !st;
+    pill = st === 'shown' ? '<span class="usage-pill shown" title="Shown by this bookmark">shown</span>'
+      : st === 'hidden' ? '<span class="usage-pill" title="Hidden by this bookmark">hidden</span>'
+      : st === 'via group' ? '<span class="usage-pill" title="Its group is hidden under this bookmark">hidden · group</span>'
+      : '<span class="usage-pill structural" title="This bookmark doesn\'t change it; it keeps its current state">unchanged</span>';
+  } else {
+    const hidden = hiddenState(v, groupsById);
+    if (hidden) pill = `<span class="usage-pill" title="${hidden === 'yes' ? 'Hidden' : 'Hidden because its group is hidden'}">${hidden === 'yes' ? 'hidden' : 'hidden · group'}</span>`;
+  }
   return `
-    <div class="visual-item"${v.id ? ` title="Visual ID: ${esc(v.id)}"` : ''}>
+    <div class="visual-item${untouched ? ' untouched' : ''}"${v.id ? ` title="Visual ID: ${esc(v.id)}"` : ''}>
       <span class="visual-type">${esc(v.type)}</span>
       <div style="flex:1;min-width:0">
         ${text ? `<div class="visual-label">${esc(text)}${kind !== 'title' ? `<span class="visual-label-kind">${esc(kind)}</span>` : ''}</div>` : ''}
@@ -4588,7 +4723,7 @@ function visualRowHtml(v, groupsById, search) {
           ${v.fields.length ? v.fields.map(f => highlightSearchMatches(f.ref, search)).join(' · ') : '<em style="color:var(--text-3)">no field bindings</em>'}
         </div>
       </div>
-      ${hidden ? `<span class="usage-pill" title="${hidden === 'yes' ? 'Hidden' : 'Hidden because its group is hidden'}">${hidden === 'yes' ? 'hidden' : 'hidden · group'}</span>` : ''}
+      ${pill}
       ${group ? `<span class="visual-group">▣ ${esc(group.name || group.id)}</span>` : ''}
       <span style="font-family:var(--mono);font-size:10px;color:var(--text-3);white-space:nowrap" title="x,y · width × height${v.z ? ' (z=' + v.z + ')' : ''}${v.tabOrder != null ? ' (tab=' + v.tabOrder + ')' : ''}">
         ${v.x},${v.y} · ${v.width}×${v.height}
@@ -4700,6 +4835,12 @@ function renderSinglePageDetail(root) {
     ? ` (no visual matches <span style="font-family:var(--mono);color:var(--text-2)">"${esc(search)}"</span>)`
     : (hideUnbound ? ' (all filtered out by "Hide unbound")' : '');
 
+  // Preview one of this page's bookmarks: each row then shows what that bookmark does to it.
+  // Options carry the bookmark's index, never file text, as their value.
+  const bms = (App.state.bookmarks || []).filter(b => b.page === p.name);
+  const bmIndex = App.state.pageBookmark[p.name] ?? -1;
+  const bookmark = bms[bmIndex] || null;
+
   root.innerHTML = `
     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:18px;padding-bottom:14px;border-bottom:1px solid var(--border)">
       <span class="source-type-badge other">page</span>
@@ -4709,10 +4850,24 @@ function renderSinglePageDetail(root) {
       <span class="source-count" style="margin-left:auto">${countLabel}</span>
     </div>
 
+    ${bms.length ? `
+    <div class="page-bookmark-bar">
+      <span>Bookmark</span>
+      <select id="pageBookmarkSelect">
+        <option value="-1"${bookmark ? '' : ' selected'}>Default (as saved)</option>
+        ${bms.map((b, i) => `<option value="${i}"${i === bmIndex ? ' selected' : ''}>${esc(b.folder ? `${b.folder} / ${b.name}` : b.name)}</option>`).join('')}
+      </select>
+      ${bookmark ? `<span style="color:var(--text-3)">${bookmark.display
+        ? `${bookmark.targets ? `applies to ${bookmark.targets.length} selected visual${bookmark.targets.length === 1 ? '' : 's'}` : 'applies to all visuals'}; faded rows keep their current state`
+        : 'doesn\'t capture display — it only changes filters, so no visual changes'}</span>` : ''}
+    </div>` : ''}
+
     ${visuals.length === 0
       ? `<div style="color:var(--text-3);font-style:italic;padding:12px 0">No visuals to show${emptyHint}.</div>`
-      : visuals.map(v => visualRowHtml(v, groupsById, search)).join('')}
+      : visuals.map(v => visualRowHtml(v, groupsById, search, bookmark)).join('')}
   `;
+  const sel = document.getElementById('pageBookmarkSelect');
+  if (sel) sel.onchange = () => { App.state.pageBookmark[p.name] = Number(sel.value); renderPageDetail(); };
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -5157,6 +5312,7 @@ function renderNotes() {
       <li>Page order read from <code>pages.json → pageOrder[]</code>; if absent, all <code>[pageName]/page.json</code> files are discovered by scanning</li>
       <li>Per-page metadata from <code>[pageName]/page.json</code> — <code>name</code>, <code>displayName</code>, <code>width</code>, <code>height</code>, <code>visibility: "HiddenInViewMode"</code> (hidden) and <code>type</code> (<code>Drillthrough</code> / <code>Tooltip</code>). A <code>pageBinding</code> alone isn't read as a kind: real reports keep one on ordinary, visible pages.</li>
       <li>Each visual lives at <code>[pageName]/visuals/[visualName]/visual.json</code> — ID from <code>name</code>, type from <code>visual.visualType</code>, position from <code>position.{x,y,z,width,height,tabOrder}</code>, field bindings from <code>visual.query.queryState.[role].projections[].queryRef</code> (falls back to walking <code>field</code> when <code>queryRef</code> is missing), hidden from <code>isHidden</code>, title from <code>visual.visualContainerObjects.title</code>, parent group from <code>parentGroupName</code>. A container declaring <code>visualGroup</code> is a group (name, <code>isHidden</code>), not a visual.</li>
+      <li><strong>Bookmarks</strong> (both formats: PBIR <code>bookmarks/*.bookmark.json</code>, ordered and foldered by <code>bookmarks.json</code> whose folders list bookmark names; legacy <code>config.bookmarks</code>, folders holding the bookmark objects under <code>children</code>). A bookmark captures one page (<code>explorationState.activeSection</code>); its show/hide state is <code>sections[page].visualContainers[id].singleVisual.display.mode</code> (<code>"hidden"</code>, or absent for a captured visual that's shown) and <code>visualContainerGroups[id].isHidden</code> for groups, nested under <code>children</code>. <code>options.suppressDisplay</code> means it sets no visibility, <code>suppressData</code> no filters, and <code>applyOnlyToTargetVisuals</code> limits it to <code>targetVisualNames</code>. Confirmed against real show/hide bookmarks: FHSQLMonitor's filter panels toggle group state on selected visuals; comodu20's and Pensadero's legacy reports hide visuals directly.</li>
       <li>Each visual, page and report-level JSON file is parsed and passed <em>separately</em> through the same reference walker used for the legacy format (concatenated JSON documents wouldn't parse), so the Usage analyzer works identically across both</li>
     </ul>
     <p>Microsoft docs: <a href="https://learn.microsoft.com/en-us/power-bi/developer/projects/projects-report" target="_blank">PBIP Report folder</a> · <a href="https://github.com/microsoft/json-schemas/tree/main/fabric/item/report/definition" target="_blank">PBIR JSON schemas</a></p>
@@ -5170,6 +5326,7 @@ function renderNotes() {
       <li><strong>Copy</strong> uses the async Clipboard API with a <code>document.execCommand('copy')</code> fallback for <code>file://</code>; <strong>Download</strong> writes a <code>&lt;projectName&gt;.md</code> via a Blob URL</li>
       <li>Built by <code>buildMarkdownExport(opts)</code> from <code>App.state</code> — same data the other tabs render, so it always reflects the loaded model (legacy or PBIR)</li>
       <li><strong>Report pages</strong> — each page's heading carries <code>· hidden</code> / <code>· drillthrough</code> / <code>· tooltip</code> and its page ID, then a table with one row per visual and per group: <em>Visual ID</em> (the key bookmarks use in <code>targetVisualNames</code> and <code>visualContainers</code> / <code>visualContainerGroups</code>), type, title, hidden (<code>yes</code>, or <code>via group</code> when an enclosing group is hidden — how bookmark-toggled panels usually work), group, fields. The title is the visual's own when set; otherwise the measure driving a dynamic title <em>(dynamic)</em>, a textbox's text <em>(text)</em>, or an auto label shaped like Power BI's default title, e.g. "Sales Amount by Category" <em>(auto)</em> — most visuals set no title of their own.</li>
+      <li><strong>Bookmarks per page</strong> — a table of the page's bookmarks (ID, folder, "all visuals" or <em>N selected visuals</em>, whether it captures display and/or data), then a matrix: one column per bookmark, a <em>Default</em> column, and a row for each visual or group some bookmark leaves differently from its default. Cells: <code>shown</code>, <code>hidden</code>, <code>via group</code> (an enclosing group ends up hidden — how panel bookmarks usually work), or <code>—</code> (the bookmark doesn't touch it: it doesn't capture display, the visual is outside its selected visuals, or the visual was added after it was made). Past six bookmarks the page gets one line per bookmark instead (shows / hides / hidden via group). Bookmarks whose page no longer exists are listed at the end. The Pages tab previews any bookmark on a page the same way.</li>
     </ul>
 
     <h2>13. Known limitations / TODO</h2>
@@ -5179,7 +5336,7 @@ function renderNotes() {
       <li><strong>RLS / row-level security roles</strong> — not surfaced.</li>
       <li><strong>Translations / cultures</strong> — present in TMDL but not displayed.</li>
       <li><strong>Detail rows expressions</strong>, <strong>KPI goals</strong>, <strong>perspectives</strong> — not surfaced.</li>
-      <li><strong>Bookmarks</strong> are read for field references only — their captured show/hide state isn't surfaced (the Export lists visual and group IDs so it can be matched externally). <strong>Themes</strong> aren't parsed.</li>
+      <li><strong>Bookmarks</strong> — a cell is what applying the bookmark does, read from the file; "—" means it leaves the visual in whatever state it's in, which PBIP can't tell you (it depends on what was clicked before). Filter state a bookmark captures is used for field references but not shown. <strong>Themes</strong> aren't parsed.</li>
     </ul>
 
     <h2>14. Is it offline-safe?</h2>
@@ -5985,6 +6142,8 @@ function buildMarkdownExport(o) {
   // ── Report pages ──
   // One row per visual and per group, keyed by the ID bookmarks use (targetVisualNames, the
   // visualContainers / visualContainerGroups keys), so a bookmark can be matched to what it touches.
+  // Then what each of the page's bookmarks does to them: a matrix with a column per bookmark, or a
+  // line per bookmark once there are more than six (a matrix that wide stops being readable).
   if (o.pages && s.pages.length) {
     push('## Report pages', '');
     const labelCell = (v) => {
@@ -5994,27 +6153,80 @@ function buildMarkdownExport(o) {
       if (kind === 'title') return t;
       return kind === 'text' ? `"${t}" _(text)_` : `${t} _(${kind})_`;
     };
+    const idCell = (id) => id ? `\`${id}\`` : '—';
+    const bookmarkTable = (bms) => {
+      push('| Bookmark | ID | Folder | Applies to | Captures |', '|---|---|---|---|---|');
+      for (const b of bms) {
+        const scope = b.targets ? `${b.targets.length} selected visual${b.targets.length === 1 ? '' : 's'}` : 'all visuals';
+        const captures = [b.display ? 'display' : '', b.data ? 'data' : ''].filter(Boolean).join(', ') || '—';
+        push(`| ${mdCell(b.name)} | ${idCell(b.id)} | ${mdCell(b.folder)} | ${scope} | ${captures} |`);
+      }
+      push('');
+    };
     for (const p of s.pages) {
       const dim = p.width && p.height ? ` _(${p.width}×${p.height})_` : '';
       const flags = [p.hidden ? 'hidden' : '', (p.kind || '').toLowerCase()].filter(Boolean);
       push(`### ${p.displayName || p.name}${dim}${flags.map(f => ` · ${f}`).join('')}`, '');
       push(`Page ID: \`${p.name}\``, '');
       const groups = p.groups || [];
-      if (!p.visuals.length && !groups.length) { push('_No visuals._', ''); continue; }
       const groupsById = new Map(groups.map(g => [g.id, g]));
       const groupName = (id) => { const g = groupsById.get(id); return g ? (g.name || g.id) : ''; };
-      const idCell = (id) => id ? `\`${id}\`` : '—';
-      push('| Visual ID | Type | Title | Hidden | Group | Fields |', '|---|---|---|---|---|---|');
-      for (const g of groups) {
-        const n = p.visuals.filter(v => v.parentGroup === g.id).length + groups.filter(x => x.parentGroup === g.id).length;
-        push(`| ${idCell(g.id)} | group | ${mdCell(g.name || '—')} | ${hiddenState(g, groupsById)} | ${mdCell(groupName(g.parentGroup))} | ${n} member${n === 1 ? '' : 's'} |`);
+      if (!p.visuals.length && !groups.length) push('_No visuals._', '');
+      else {
+        push('| Visual ID | Type | Title | Hidden | Group | Fields |', '|---|---|---|---|---|---|');
+        for (const g of groups) {
+          const n = p.visuals.filter(v => v.parentGroup === g.id).length + groups.filter(x => x.parentGroup === g.id).length;
+          push(`| ${idCell(g.id)} | group | ${mdCell(g.name || '—')} | ${hiddenState(g, groupsById)} | ${mdCell(groupName(g.parentGroup))} | ${n} member${n === 1 ? '' : 's'} |`);
+        }
+        for (const v of p.visuals) {
+          const fieldList = v.fields && v.fields.length ? v.fields.map(f => f.ref).join(', ') : '—';
+          push(`| ${idCell(v.id)} | ${mdCell(v.type)} | ${mdCell(labelCell(v))} | ${hiddenState(v, groupsById)} | ${mdCell(groupName(v.parentGroup))} | ${mdCell(fieldList)} |`);
+        }
+        push('');
       }
-      for (const v of p.visuals) {
-        const fieldList = v.fields && v.fields.length ? v.fields.map(f => f.ref).join(', ') : '—';
-        push(`| ${idCell(v.id)} | ${mdCell(v.type)} | ${mdCell(labelCell(v))} | ${hiddenState(v, groupsById)} | ${mdCell(groupName(v.parentGroup))} | ${mdCell(fieldList)} |`);
+
+      const bms = (s.bookmarks || []).filter(b => b.page === p.name);
+      if (!bms.length) continue;
+      push('#### Bookmarks', '');
+      bookmarkTable(bms);
+      // A row is listed only when some bookmark leaves it differently from its default. A bookmark
+      // that captures the whole page "shows" every visible visual, so listing everything it
+      // touches buried the few visuals it actually switches under ones that never change.
+      const rows = [...groups.map(it => ({ it, isGroup: true })), ...p.visuals.map(it => ({ it, isGroup: false }))]
+        .map(r => ({ ...r,
+          def: ({ yes: 'hidden', 'via group': 'via group' })[hiddenState(r.it, groupsById)] || 'shown',
+          states: bms.map(b => bookmarkState(b, r.it, r.isGroup, groupsById)) }));
+      const changed = rows.filter(r => r.states.some(st => st && st !== r.def));
+      if (bms.length <= 6) {
+        if (changed.length) {
+          push(`| Visual ID | Type | Title | Group | Default | ${bms.map(b => mdCell(b.name)).join(' | ')} |`,
+            `|---|---|---|---|---|${bms.map(() => '---').join('|')}|`);
+          for (const r of changed) {
+            const title = r.isGroup ? (r.it.name || '—') : labelCell(r.it);
+            push(`| ${idCell(r.it.id)} | ${r.isGroup ? 'group' : mdCell(r.it.type)} | ${mdCell(title)} | ${mdCell(groupName(r.it.parentGroup))} | ${r.def} | ${r.states.map(st => st || '—').join(' | ')} |`);
+          }
+        }
+      } else {
+        const itemName = (r) => {
+          const t = r.isGroup ? (r.it.name || r.it.id) : (visualLabel(r.it).text || r.it.type);
+          return `${t.length > 60 ? t.slice(0, 59) + '…' : t} (\`${r.it.id}\`)`;
+        };
+        bms.forEach((b, i) => {
+          const parts = [['shows', 'shown'], ['hides', 'hidden'], ['hidden via group', 'via group']]
+            .map(([label, st]) => [label, changed.filter(r => r.states[i] === st).map(itemName)])
+            .filter(([, items]) => items.length)
+            .map(([label, items]) => `${label}: ${items.join(', ')}`);
+          push(`- **${mdCell(b.name)}** ${idCell(b.id)} — ${parts.join('; ') || 'no show/hide changes'}`);
+        });
       }
+      const others = rows.length - changed.length;
+      if (others) push('', `_${others} other visual${others === 1 ? " isn't" : "s aren't"} changed by any bookmark on this page._`);
       push('');
     }
+    // A bookmark whose page has since been deleted would otherwise drop out of the export.
+    const pageNames = new Set(s.pages.map(p => p.name));
+    const orphans = (s.bookmarks || []).filter(b => !pageNames.has(b.page));
+    if (orphans.length) { push('### Bookmarks without a matching page', ''); bookmarkTable(orphans); }
   }
 
   // ── Unused ──
