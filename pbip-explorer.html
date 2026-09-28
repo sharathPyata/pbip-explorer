@@ -958,6 +958,15 @@ tr.row-unused td:first-child { font-style: italic; }
   letter-spacing: 0.04em;
   min-width: 80px; text-align: center;
 }
+.visual-label {
+  font-size: 12px; font-weight: 600; color: var(--text); margin-bottom: 2px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.visual-label-kind { font-size: 10px; font-weight: 400; font-style: italic; color: var(--text-3); margin-left: 6px; }
+.visual-group {
+  font-family: var(--mono); font-size: 10px; color: var(--text-3);
+  white-space: nowrap; max-width: 180px; overflow: hidden; text-overflow: ellipsis;
+}
 
 /* ── Search results ── */
 .search-results-panel {
@@ -2459,6 +2468,97 @@ function fromM(mCode, keyPrefix, nameOverride) {
 /* ═══════════════════════════════════════════════════════════════
    REPORT.JSON PARSING
    ═══════════════════════════════════════════════════════════════ */
+
+/* ── Visual identity: title, text, label, hidden state ──
+   Both report formats store a formatting value as { expr: { Literal: { Value: "'text'" } } }: a
+   string literal keeps its single quotes, with an embedded quote doubled, DAX-style. */
+function literalValue(node) {
+  const v = node && node.expr && node.expr.Literal && node.expr.Literal.Value;
+  if (typeof v !== 'string') return '';
+  const m = v.match(/^'([\s\S]*)'$/);
+  return m ? m[1].replace(/''/g, "'") : v;
+}
+
+/* A visual's own title (PBIR visual.visualContainerObjects.title, legacy singleVisual.vcObjects.title).
+   A constant comes back as `title`; one driven by a measure or column (conditional formatting) as
+   `titleExpr`, e.g. MeasuresTable[Header text]. Most visuals set neither — what Power BI shows then
+   is an auto-title built from the fields, which visualLabel() reconstructs. */
+function readVisualTitle(titleObjects) {
+  for (const entry of (Array.isArray(titleObjects) ? titleObjects : [])) {
+    const text = entry && entry.properties && entry.properties.text;
+    if (!text) continue;
+    const lit = literalValue(text);
+    if (lit) return { title: lit, titleExpr: '' };
+    const e = text.expr || {};
+    const src = e.Measure || e.Column || (e.Aggregation && e.Aggregation.Expression && e.Aggregation.Expression.Column);
+    if (src && src.Property) {
+      const ent = src.Expression && src.Expression.SourceRef && src.Expression.SourceRef.Entity;
+      return { title: '', titleExpr: ent ? `${ent}[${src.Property}]` : `[${src.Property}]` };
+    }
+  }
+  return { title: '', titleExpr: '' };
+}
+
+/* A textbox has no title; its text is the natural name. Same shape in both formats:
+   objects.general[0].properties.paragraphs[].textRuns[].value. A run's value can instead be a
+   dynamic value bound to a field (an object), shown as "…", and a run can hold conditional `cases`,
+   of which the first stands in. Capped, since a textbox can hold a page of prose. */
+function readTextboxText(objects) {
+  const general = ((objects && objects.general) || [])[0];
+  const paras = general && general.properties && general.properties.paragraphs;
+  if (!Array.isArray(paras)) return '';
+  const runText = (runs) => (Array.isArray(runs) ? runs : []).map(r =>
+    !r ? '' : typeof r.value === 'string' ? r.value
+      : Array.isArray(r.cases) ? runText((r.cases[0] || {}).textRuns)
+      : r.value ? '…' : '').join('');
+  const text = paras.map(p => runText(p && p.textRuns).trim()).filter(Boolean).join(' / ');
+  return text.length > 200 ? text.slice(0, 199) + '…' : text;
+}
+
+/* Roles that make up the "by" half of Power BI's default title ("Sales Amount by Category").
+   Tooltip-only fields never appear in it. */
+const TITLE_CATEGORY_ROLES = /^(Category|Axis|Rows|Columns|Series|Legend|Group|Details)$/i;
+function listText(items) {
+  if (items.length <= 2) return items.join(' and ');
+  if (items.length <= 4) return items.slice(0, -1).join(', ') + ' and ' + items[items.length - 1];
+  return items.slice(0, 3).join(', ') + ` and ${items.length - 3} more`;
+}
+function autoVisualTitle(fields) {
+  const values = [], cats = [];
+  for (const f of (fields || [])) {
+    if (/^Tooltips?$/i.test(f.role || '')) continue;
+    const name = f.name || (parseQueryRef(f.ref) || {}).field || f.ref;
+    const list = TITLE_CATEGORY_ROLES.test(f.role || '') ? cats : values;
+    if (name && !list.includes(name)) list.push(name);
+  }
+  if (!values.length) return listText(cats);
+  return listText(values) + (cats.length ? ' by ' + listText(cats) : '');
+}
+
+/* What to call a visual: its title if set, else the field driving a dynamic title, else a
+   textbox's text, else an auto label shaped like Power BI's default titles. `kind` says which, so
+   an auto label is never mistaken for a title someone chose. */
+function visualLabel(v) {
+  if (v.title) return { text: v.title, kind: 'title' };
+  if (v.titleExpr) return { text: v.titleExpr, kind: 'dynamic' };
+  if (v.text) return { text: v.text, kind: 'text' };
+  const auto = autoVisualTitle(v.fields);
+  return { text: auto, kind: auto ? 'auto' : '' };
+}
+
+/* 'yes' if a visual or group is hidden itself, 'via group' if an enclosing group is, else ''.
+   Bookmark-driven panels usually hide the group and leave the members' own flag unset, so the
+   visual's own isHidden alone would call most of a hidden panel visible. */
+function hiddenState(item, groupsById) {
+  if (item.isHidden) return 'yes';
+  const seen = new Set();
+  for (let g = groupsById.get(item.parentGroup); g && !seen.has(g.id); g = groupsById.get(g.parentGroup)) {
+    seen.add(g.id);
+    if (g.isHidden) return 'via group';
+  }
+  return '';
+}
+
 function parseReport(text) {
   let r;
   try { r = JSON.parse(text); } catch (e) { return []; }
@@ -2470,9 +2570,18 @@ function parseReport(text) {
     const pageW = Math.round(s.width ?? sectionCfg.width ?? 0);
     const pageH = Math.round(s.height ?? sectionCfg.height ?? 0);
 
-    const visuals = (s.visualContainers || []).map(vc => {
+    const visuals = [], groups = [];
+    for (const vc of (s.visualContainers || [])) {
       let cfg = {};
       try { cfg = typeof vc.config === 'string' ? JSON.parse(vc.config) : (vc.config || {}); } catch(e){}
+      // A group is a container, not a visual: no type or fields, just a name, a hidden flag and
+      // members that point back at it through parentGroupName. Counting it as a visual inflated
+      // every page's visual count with "unknown" entries.
+      if (cfg.singleVisualGroup) {
+        groups.push({ id: cfg.name || '', name: cfg.singleVisualGroup.displayName || '',
+          isHidden: !!cfg.singleVisualGroup.isHidden, parentGroup: cfg.parentGroupName || '' });
+        continue;
+      }
       const singleVisual = cfg.singleVisual || {};
       const type = singleVisual.visualType || 'unknown';
       const fields = [];
@@ -2492,13 +2601,27 @@ function parseReport(text) {
       const width = Math.round(vc.width ?? layoutPos.width ?? 0);
       const height = Math.round(vc.height ?? layoutPos.height ?? 0);
       const tabOrder = layoutPos.tabOrder ?? null;
-      return { type, fields, x, y, z, width, height, tabOrder };
-    });
+      const { title, titleExpr } = readVisualTitle((singleVisual.vcObjects || {}).title);
+      visuals.push({
+        type, fields, x, y, z, width, height, tabOrder,
+        id: cfg.name || '',   // what bookmarks call the visual (targetVisualNames, visualContainers)
+        isHidden: ((singleVisual.display || {}).mode || '') === 'hidden',
+        parentGroup: cfg.parentGroupName || '',
+        title, titleExpr,
+        text: type === 'textbox' ? readTextboxText(singleVisual.objects) : '',
+      });
+    }
     return {
       name: s.name || '',
       displayName: s.displayName || s.name || 'Unnamed',
       width: pageW, height: pageH,
-      visuals,
+      // The section config encodes page kind numerically: visibility 1 = hidden in view mode,
+      // type 1 = tooltip page, type 2 = drillthrough. Some older drillthrough pages have no type,
+      // only a drillthrough filter (howCreated 5) — but tooltip pages carry those filters too, so
+      // the filter alone isn't read as a kind.
+      hidden: sectionCfg.visibility === 1,
+      kind: sectionCfg.type === 1 ? 'Tooltip' : sectionCfg.type === 2 ? 'Drillthrough' : '',
+      visuals, groups,
     };
   });
 }
@@ -2568,13 +2691,19 @@ async function parsePbirReport(byPath, pagesRoot) {
     const visualKeys = Object.keys(byPath).filter(k =>
       k.startsWith(visualPrefix) && k.endsWith('/visual.json'));
     const visualTexts = await Promise.all(visualKeys.map(vk => byPath[vk].text().catch(() => null)));
-    const visuals = [];
+    const visuals = [], groups = [];
     for (const t of visualTexts) {
       if (t == null) continue;
       try {
         const vJson = JSON.parse(t);
         allJson.push(vJson);
-        visuals.push(parsePbirVisual(vJson));
+        // A group container declares visualGroup instead of visual (see parseReport).
+        if (vJson.visualGroup) {
+          groups.push({ id: vJson.name || '', name: vJson.visualGroup.displayName || '',
+            isHidden: !!vJson.isHidden, parentGroup: vJson.parentGroupName || '' });
+        } else {
+          visuals.push(parsePbirVisual(vJson));
+        }
       } catch (e) {}
     }
 
@@ -2584,7 +2713,11 @@ async function parsePbirReport(byPath, pagesRoot) {
       displayName: pageJson.displayName || pageJson.name || pageName,
       width: Math.round(pageJson.width || 0),
       height: Math.round(pageJson.height || 0),
-      visuals,
+      // Only `type` marks a drillthrough / tooltip page. A pageBinding can outlive that role:
+      // real reports keep one of type "Drillthrough" on ordinary, visible pages.
+      hidden: pageJson.visibility === 'HiddenInViewMode',
+      kind: pageJson.type || '',
+      visuals, groups,
     });
   }));
   // Restore the intended page order, then drop the temporary sort key
@@ -2665,11 +2798,21 @@ function parsePbirVisual(vJson) {
     const projections = (queryState[role] && queryState[role].projections) || [];
     for (const p of projections) {
       const ref = p.queryRef || p.nativeQueryRef || pbirFieldToRef(p.field);
-      if (ref) fields.push({ role, ref });
+      // name: what the visual calls the field (a rename, else e.g. "Sum of Quantity"), used by
+      // the auto label the way Power BI's default title uses it.
+      if (ref) fields.push({ role, ref, name: p.displayName || p.nativeQueryRef || '' });
     }
   }
 
-  return { type, fields, x, y, z, width, height, tabOrder };
+  const { title, titleExpr } = readVisualTitle((visual.visualContainerObjects || {}).title);
+  return {
+    type, fields, x, y, z, width, height, tabOrder,
+    id: (vJson && vJson.name) || '',   // what bookmarks call the visual
+    isHidden: !!(vJson && vJson.isHidden),
+    parentGroup: (vJson && vJson.parentGroupName) || '',
+    title, titleExpr,
+    text: type === 'textbox' ? readTextboxText(visual.objects) : '',
+  };
 }
 
 /* Fallback: derive a "Entity.Property" string from a QueryExpressionContainer when the
@@ -4371,7 +4514,7 @@ function renderPages() {
                 <div class="pages-list-meta">
                   ${search
                     ? `<span class="${stat.matches>0?'m':'u'}">${stat.matches} match${stat.matches!==1?'es':''}</span> · <span class="v">${stat.total} visual${stat.total!==1?'s':''}</span>`
-                    : `<span class="v">${stat.total} visual${stat.total!==1?'s':''}</span>${unbound > 0 ? ` · <span class="u">${unbound} unbound</span>` : ''}`}
+                    : `<span class="v">${stat.total} visual${stat.total!==1?'s':''}</span>${unbound > 0 ? ` · <span class="u">${unbound} unbound</span>` : ''}`}${[p.hidden ? 'hidden' : '', (p.kind || '').toLowerCase()].filter(Boolean).map(f => ` · <span class="u">${esc(f)}</span>`).join('')}
                 </div>
               </div>
             `;
@@ -4423,6 +4566,36 @@ function highlightSearchMatches(text, search) {
     '<mark style="background:#fff3a8;color:inherit;padding:0 1px;border-radius:2px">', '</mark>');
 }
 
+/* Hidden / drillthrough / tooltip pills for a page — the rail and both detail views. */
+function pageFlagsHtml(p) {
+  return (p.hidden ? '<span class="usage-pill" title="Hidden in view mode">hidden</span>' : '')
+    + (p.kind ? `<span class="usage-pill structural" title="${p.kind === 'Tooltip' ? 'Tooltip page' : 'Drillthrough page'}">${esc(p.kind.toLowerCase())}</span>` : '');
+}
+
+/* One visual row: type, label (title, dynamic title, textbox text or auto label), field
+   bindings, hidden state and group. Shared by the All Pages and single-page views. Only the ID
+   goes into an attribute (PBIR names are word characters or hyphens; legacy ones are hex). */
+function visualRowHtml(v, groupsById, search) {
+  const { text, kind } = visualLabel(v);
+  const hidden = hiddenState(v, groupsById);
+  const group = groupsById.get(v.parentGroup);
+  return `
+    <div class="visual-item"${v.id ? ` title="Visual ID: ${esc(v.id)}"` : ''}>
+      <span class="visual-type">${esc(v.type)}</span>
+      <div style="flex:1;min-width:0">
+        ${text ? `<div class="visual-label">${esc(text)}${kind !== 'title' ? `<span class="visual-label-kind">${esc(kind)}</span>` : ''}</div>` : ''}
+        <div style="font-family:var(--mono);color:var(--text-2);font-size:11px">
+          ${v.fields.length ? v.fields.map(f => highlightSearchMatches(f.ref, search)).join(' · ') : '<em style="color:var(--text-3)">no field bindings</em>'}
+        </div>
+      </div>
+      ${hidden ? `<span class="usage-pill" title="${hidden === 'yes' ? 'Hidden' : 'Hidden because its group is hidden'}">${hidden === 'yes' ? 'hidden' : 'hidden · group'}</span>` : ''}
+      ${group ? `<span class="visual-group">▣ ${esc(group.name || group.id)}</span>` : ''}
+      <span style="font-family:var(--mono);font-size:10px;color:var(--text-3);white-space:nowrap" title="x,y · width × height${v.z ? ' (z=' + v.z + ')' : ''}${v.tabOrder != null ? ' (tab=' + v.tabOrder + ')' : ''}">
+        ${v.x},${v.y} · ${v.width}×${v.height}
+      </span>
+    </div>`;
+}
+
 /* Update the active page selection without rebuilding the sidebar list, preserving
    the user's scroll position. Same pattern as setActiveTableInList. */
 function setActivePageInList(name) {
@@ -4470,6 +4643,7 @@ function renderAllPagesDetail(root) {
       return true;
     });
     const stat = pageStats[pi];
+    const groupsById = new Map((p.groups || []).map(g => [g.id, g]));
     const countLabel = search
       ? `${visuals.length} match${visuals.length!==1?'es':''} of ${stat.total}`
       : (hideUnbound
@@ -4482,22 +4656,12 @@ function renderAllPagesDetail(root) {
         <div class="page-head">
           <div style="display:flex;align-items:center;gap:10px">
             <span class="source-type-badge other">page</span>
-            <a href="#" data-page-link="${esc(p.name)}" style="font-weight:600;color:var(--text);text-decoration:none">${esc(p.displayName || p.name)}</a>
+            <a href="#" data-page-link="${esc(p.name)}" style="font-weight:600;color:var(--text);text-decoration:none">${esc(p.displayName || p.name)}</a>${pageFlagsHtml(p)}
             ${p.width && p.height ? `<span style="font-family:var(--mono);font-size:11px;color:var(--text-3)">${p.width}×${p.height} px</span>` : ''}
           </div>
           <span class="source-count">${countLabel}</span>
         </div>
-        ${visuals.map(v => `
-          <div class="visual-item">
-            <span class="visual-type">${esc(v.type)}</span>
-            <div style="flex:1;font-family:var(--mono);color:var(--text-2);font-size:11px">
-              ${v.fields.length ? v.fields.map(f => highlightSearchMatches(f.ref, search)).join(' · ') : '<em style="color:var(--text-3)">no field bindings</em>'}
-            </div>
-            <span style="font-family:var(--mono);font-size:10px;color:var(--text-3);white-space:nowrap" title="x,y · width × height${v.z ? ' (z=' + v.z + ')' : ''}${v.tabOrder != null ? ' (tab=' + v.tabOrder + ')' : ''}">
-              ${v.x},${v.y} · ${v.width}×${v.height}
-            </span>
-          </div>
-        `).join('')}
+        ${visuals.map(v => visualRowHtml(v, groupsById, search)).join('')}
       </div>
     `;
   }).join('');
@@ -4525,6 +4689,7 @@ function renderSinglePageDetail(root) {
     return true;
   });
   const totalAll = p.visuals.length;
+  const groupsById = new Map((p.groups || []).map(g => [g.id, g]));
   const countLabel = search
     ? `${visuals.length} match${visuals.length!==1?'es':''} of ${totalAll}`
     : (hideUnbound
@@ -4538,24 +4703,15 @@ function renderSinglePageDetail(root) {
   root.innerHTML = `
     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:18px;padding-bottom:14px;border-bottom:1px solid var(--border)">
       <span class="source-type-badge other">page</span>
-      <span style="font-weight:600;font-size:16px">${esc(p.displayName || p.name)}</span>
+      <span style="font-weight:600;font-size:16px">${esc(p.displayName || p.name)}</span>${pageFlagsHtml(p)}
       ${p.width && p.height ? `<span style="font-family:var(--mono);font-size:12px;color:var(--text-3)">${p.width}×${p.height} px</span>` : ''}
+      <span style="font-family:var(--mono);font-size:11px;color:var(--text-3)">${esc(p.name)}</span>
       <span class="source-count" style="margin-left:auto">${countLabel}</span>
     </div>
 
     ${visuals.length === 0
       ? `<div style="color:var(--text-3);font-style:italic;padding:12px 0">No visuals to show${emptyHint}.</div>`
-      : visuals.map(v => `
-          <div class="visual-item">
-            <span class="visual-type">${esc(v.type)}</span>
-            <div style="flex:1;font-family:var(--mono);color:var(--text-2);font-size:11px">
-              ${v.fields.length ? v.fields.map(f => highlightSearchMatches(f.ref, search)).join(' · ') : '<em style="color:var(--text-3)">no field bindings</em>'}
-            </div>
-            <span style="font-family:var(--mono);font-size:10px;color:var(--text-3);white-space:nowrap" title="x,y · width × height${v.z ? ' (z=' + v.z + ')' : ''}${v.tabOrder != null ? ' (tab=' + v.tabOrder + ')' : ''}">
-              ${v.x},${v.y} · ${v.width}×${v.height}
-            </span>
-          </div>
-        `).join('')}
+      : visuals.map(v => visualRowHtml(v, groupsById, search)).join('')}
   `;
 }
 
@@ -4992,14 +5148,16 @@ function renderNotes() {
       <li>Visual type from <code>config.singleVisual.visualType</code> (config is stringified JSON, parsed on the fly)</li>
       <li>Field bindings from <code>config.singleVisual.projections[role][].queryRef</code></li>
       <li>Dimensions (width/height) extracted for display</li>
+      <li>Page flags from the section's stringified <code>config</code>: <code>visibility: 1</code> = hidden in view mode, <code>type: 1</code> = tooltip page, <code>type: 2</code> = drillthrough. Some older drillthrough pages have no <code>type</code>, only a drillthrough filter (<code>howCreated: 5</code>); tooltip pages carry those too, so the filter alone isn't read as a kind.</li>
+      <li>Per visual: ID from <code>config.name</code> (what bookmarks call it), hidden from <code>singleVisual.display.mode === "hidden"</code>, title from <code>singleVisual.vcObjects.title</code>, parent group from <code>config.parentGroupName</code>. A <code>singleVisualGroup</code> container is a <em>group</em> (name, <code>isHidden</code>), not a visual — it no longer counts as an "unknown" visual.</li>
     </ul>
     <h3>11.2 PBIR (per-file, default for new reports since 2026)</h3>
     <ul>
       <li>Detected by the <code>*.Report/definition/pages/</code> folder — identified via <code>pages.json</code> OR any <code>[pageName]/page.json</code> under it, since <code>pages.json</code> is optional per the spec (PBIR is preferred when both formats coexist)</li>
       <li>Page order read from <code>pages.json → pageOrder[]</code>; if absent, all <code>[pageName]/page.json</code> files are discovered by scanning</li>
-      <li>Per-page metadata from <code>[pageName]/page.json</code> — <code>name</code>, <code>displayName</code>, <code>width</code>, <code>height</code></li>
-      <li>Each visual lives at <code>[pageName]/visuals/[visualName]/visual.json</code> — type from <code>visual.visualType</code>, position from <code>position.{x,y,z,width,height,tabOrder}</code>, field bindings from <code>visual.query.queryState.[role].projections[].queryRef</code> (falls back to walking <code>field</code> when <code>queryRef</code> is missing)</li>
-      <li>All visual + page JSON contents are concatenated and passed through the same reference walker used for the legacy format, so the Usage analyzer works identically across both</li>
+      <li>Per-page metadata from <code>[pageName]/page.json</code> — <code>name</code>, <code>displayName</code>, <code>width</code>, <code>height</code>, <code>visibility: "HiddenInViewMode"</code> (hidden) and <code>type</code> (<code>Drillthrough</code> / <code>Tooltip</code>). A <code>pageBinding</code> alone isn't read as a kind: real reports keep one on ordinary, visible pages.</li>
+      <li>Each visual lives at <code>[pageName]/visuals/[visualName]/visual.json</code> — ID from <code>name</code>, type from <code>visual.visualType</code>, position from <code>position.{x,y,z,width,height,tabOrder}</code>, field bindings from <code>visual.query.queryState.[role].projections[].queryRef</code> (falls back to walking <code>field</code> when <code>queryRef</code> is missing), hidden from <code>isHidden</code>, title from <code>visual.visualContainerObjects.title</code>, parent group from <code>parentGroupName</code>. A container declaring <code>visualGroup</code> is a group (name, <code>isHidden</code>), not a visual.</li>
+      <li>Each visual, page and report-level JSON file is parsed and passed <em>separately</em> through the same reference walker used for the legacy format (concatenated JSON documents wouldn't parse), so the Usage analyzer works identically across both</li>
     </ul>
     <p>Microsoft docs: <a href="https://learn.microsoft.com/en-us/power-bi/developer/projects/projects-report" target="_blank">PBIP Report folder</a> · <a href="https://github.com/microsoft/json-schemas/tree/main/fabric/item/report/definition" target="_blank">PBIR JSON schemas</a></p>
 
@@ -5011,6 +5169,7 @@ function renderNotes() {
       <li><strong>Presets</strong> — <em>Everything</em>, <em>Measures only</em>, <em>Schema only</em>, <em>AI prompt</em> (preamble + everything)</li>
       <li><strong>Copy</strong> uses the async Clipboard API with a <code>document.execCommand('copy')</code> fallback for <code>file://</code>; <strong>Download</strong> writes a <code>&lt;projectName&gt;.md</code> via a Blob URL</li>
       <li>Built by <code>buildMarkdownExport(opts)</code> from <code>App.state</code> — same data the other tabs render, so it always reflects the loaded model (legacy or PBIR)</li>
+      <li><strong>Report pages</strong> — each page's heading carries <code>· hidden</code> / <code>· drillthrough</code> / <code>· tooltip</code> and its page ID, then a table with one row per visual and per group: <em>Visual ID</em> (the key bookmarks use in <code>targetVisualNames</code> and <code>visualContainers</code> / <code>visualContainerGroups</code>), type, title, hidden (<code>yes</code>, or <code>via group</code> when an enclosing group is hidden — how bookmark-toggled panels usually work), group, fields. The title is the visual's own when set; otherwise the measure driving a dynamic title <em>(dynamic)</em>, a textbox's text <em>(text)</em>, or an auto label shaped like Power BI's default title, e.g. "Sales Amount by Category" <em>(auto)</em> — most visuals set no title of their own.</li>
     </ul>
 
     <h2>13. Known limitations / TODO</h2>
@@ -5020,7 +5179,7 @@ function renderNotes() {
       <li><strong>RLS / row-level security roles</strong> — not surfaced.</li>
       <li><strong>Translations / cultures</strong> — present in TMDL but not displayed.</li>
       <li><strong>Detail rows expressions</strong>, <strong>KPI goals</strong>, <strong>perspectives</strong> — not surfaced.</li>
-      <li><strong>Bookmarks, themes, drill-through</strong> in the report — not parsed.</li>
+      <li><strong>Bookmarks</strong> are read for field references only — their captured show/hide state isn't surfaced (the Export lists visual and group IDs so it can be matched externally). <strong>Themes</strong> aren't parsed.</li>
     </ul>
 
     <h2>14. Is it offline-safe?</h2>
@@ -5824,15 +5983,35 @@ function buildMarkdownExport(o) {
   }
 
   // ── Report pages ──
+  // One row per visual and per group, keyed by the ID bookmarks use (targetVisualNames, the
+  // visualContainers / visualContainerGroups keys), so a bookmark can be matched to what it touches.
   if (o.pages && s.pages.length) {
     push('## Report pages', '');
+    const labelCell = (v) => {
+      const { text, kind } = visualLabel(v);
+      if (!text) return '—';
+      const t = text.length > 80 ? text.slice(0, 79) + '…' : text;
+      if (kind === 'title') return t;
+      return kind === 'text' ? `"${t}" _(text)_` : `${t} _(${kind})_`;
+    };
     for (const p of s.pages) {
       const dim = p.width && p.height ? ` _(${p.width}×${p.height})_` : '';
-      push(`### ${p.displayName || p.name}${dim}`, '');
-      if (!p.visuals.length) { push('_No visuals._', ''); continue; }
+      const flags = [p.hidden ? 'hidden' : '', (p.kind || '').toLowerCase()].filter(Boolean);
+      push(`### ${p.displayName || p.name}${dim}${flags.map(f => ` · ${f}`).join('')}`, '');
+      push(`Page ID: \`${p.name}\``, '');
+      const groups = p.groups || [];
+      if (!p.visuals.length && !groups.length) { push('_No visuals._', ''); continue; }
+      const groupsById = new Map(groups.map(g => [g.id, g]));
+      const groupName = (id) => { const g = groupsById.get(id); return g ? (g.name || g.id) : ''; };
+      const idCell = (id) => id ? `\`${id}\`` : '—';
+      push('| Visual ID | Type | Title | Hidden | Group | Fields |', '|---|---|---|---|---|---|');
+      for (const g of groups) {
+        const n = p.visuals.filter(v => v.parentGroup === g.id).length + groups.filter(x => x.parentGroup === g.id).length;
+        push(`| ${idCell(g.id)} | group | ${mdCell(g.name || '—')} | ${hiddenState(g, groupsById)} | ${mdCell(groupName(g.parentGroup))} | ${n} member${n === 1 ? '' : 's'} |`);
+      }
       for (const v of p.visuals) {
-        const fieldList = v.fields && v.fields.length ? v.fields.map(f => f.ref).join(', ') : '_no field bindings_';
-        push(`- **${v.type}** — ${mdCell(fieldList)}`);
+        const fieldList = v.fields && v.fields.length ? v.fields.map(f => f.ref).join(', ') : '—';
+        push(`| ${idCell(v.id)} | ${mdCell(v.type)} | ${mdCell(labelCell(v))} | ${hiddenState(v, groupsById)} | ${mdCell(groupName(v.parentGroup))} | ${mdCell(fieldList)} |`);
       }
       push('');
     }
