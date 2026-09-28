@@ -1213,8 +1213,12 @@ const App = {
     roles: [],            // [{name, modelPermission, tablePermissions:[{table, dax}]}] from roles/*.tmdl
     perspectives: [],     // [{name, members:[{kind, table, name}]}] from perspectives/*.tmdl
     functions: [],        // [{name, dax}] DAX user-defined functions from functions.tmdl
-    reportMeasures: [],   // report-level measures from PBIR reportExtensions.json
+    reportMeasures: [],   // report-level measures (PBIR reportExtensions.json, legacy config.modelExtensions)
     bookmarks: [],        // [{id, name, folder, page, display, data, targets, visuals, groups}] — see normaliseBookmark
+    projectReports: [],   // names of the loaded report(s) — several when a shared model opens with all of them
+    reportOnly: false,    // a report whose model isn't in the project (live-connected, or its folder not dropped)
+    connection: null,     // that report's link: {kind: 'byConnection', workspace, model, id} or {kind: 'byPath', path}
+    liveReports: [],      // live-connected reports paired with the model by name: [{name, model, workspace}]
     pageBookmark: {},     // Pages tab: page name → index of the bookmark being previewed
     activeView: 'overview',
     activeTable: null,
@@ -3408,6 +3412,51 @@ function countUnused() {
   return n;
 }
 
+/* Table[Field] / 'Table'[Field] references in DAX, unchecked against any model — for a report whose
+   model isn't here. A bare [Name] can't be placed without the model, so it isn't counted. */
+function daxQualifiedRefs(dax) {
+  const out = [];
+  const re = /(?:'((?:[^']|'')+)'|([A-Za-z_]\w*))\[([^\]]+)\]/g;
+  let m;
+  while ((m = re.exec(String(dax || '')))) out.push({ table: m[1] !== undefined ? m[1].replace(/''/g, "'") : m[2], field: m[3].trim() });
+  return out;
+}
+
+/* A report-only project's dependency list: every model field the report uses — bound in a visual,
+   referenced by a filter, bookmark or other setting, or by a report-level measure's DAX — as
+   [{ table, field, visuals, other, measures }]. The report's own measures are defined in the report,
+   not the model, so they're left out. This is what the Unused tab can't give without the model:
+   what the shared model must keep for this report to work. */
+function reportFieldsUsed() {
+  const s = App.state, fields = new Map();
+  const entry = (table, field) => {
+    const k = `${table}.${field}`;
+    if (!fields.has(k)) fields.set(k, { table, field, visuals: 0, other: false, measures: new Set() });
+    return fields.get(k);
+  };
+  for (const p of s.pages) {
+    for (const v of p.visuals) {
+      const seen = new Set();
+      for (const f of v.fields) {
+        const r = parseQueryRef(f.ref);
+        if (!r || seen.has(`${r.table}.${r.field}`)) continue;
+        seen.add(`${r.table}.${r.field}`);
+        entry(r.table, r.field).visuals++;
+      }
+    }
+  }
+  for (const ref of (s.reportReferences || [])) {
+    const r = parseQueryRef(ref);
+    if (r) { const e = entry(r.table, r.field); if (!e.visuals) e.other = true; }
+  }
+  for (const rm of (s.reportMeasures || [])) {
+    for (const r of daxQualifiedRefs(rm.dax)) entry(r.table, r.field).measures.add(rm.name);
+  }
+  const own = new Set((s.reportMeasures || []).map(m => `${m.table}.${m.name}`));
+  return [...fields.values()].filter(e => !own.has(`${e.table}.${e.field}`))
+    .sort((a, b) => a.table.localeCompare(b.table) || a.field.localeCompare(b.field));
+}
+
 /* ═══════════════════════════════════════════════════════════════
    PROJECT DISCOVERY
    ═══════════════════════════════════════════════════════════════
@@ -3497,6 +3546,24 @@ async function discoverProjects(byPath) {
   // folder, that's the one — how projects without a definition.pbir have always loaded.
   if (models.size === 1) for (const r of reports) if (r.link.kind === 'none') r.model = [...models.values()][0];
 
+  // A live-connected report's model can be in the folder too: a Fabric Git export writes reports
+  // byConnection even to the model beside them (microsoft/fabric-toolbox's FCA_Core_Report →
+  // FCA_Core_SM). The connection names its model (initial catalog); a model here with that name —
+  // its folder's, or the display name in its .platform — is taken to be it when exactly one matches.
+  const live = reports.filter(r => r.link.kind === 'byConnection' && r.link.model);
+  if (live.length) {
+    for (const m of models.values()) {
+      const platform = byPath[`${m.root}/.platform`] ? await readJson(`${m.root}/.platform`) : null;
+      m.displayName = (platform && platform.metadata && platform.metadata.displayName) || '';
+    }
+    const norm = s => String(s || '').trim().toLowerCase();
+    for (const r of live) {
+      const want = norm(r.link.model);
+      const hits = [...models.values()].filter(m => norm(m.name) === want || norm(m.displayName) === want);
+      if (hits.length === 1) { r.model = hits[0]; r.link.matchedByName = true; }
+    }
+  }
+
   // A .pbip names the report it opens, which makes that report the project's main one.
   for (const k of keys.filter(k => /\.pbip$/i.test(k))) {
     const pbip = await readJson(k);
@@ -3543,12 +3610,9 @@ async function processFiles(fileList) {
     const path = f.webkitRelativePath || f._path || f.name;
     byPath[path] = f;
   }
-  const found = await discoverProjects(byPath);
-  const projects = found.filter(p => p.model);
+  const projects = await discoverProjects(byPath);
   if (!projects.length) {
-    showToast(found.length
-      ? 'Found a report but not its semantic model — report-only projects aren\'t supported yet.'
-      : 'No Power BI project found — expected a semantic model folder (definition/model.tmdl, or model.bim for TMSL), usually with a report folder (definition.pbir).', 'error');
+    showToast('No Power BI project found — expected a semantic model folder (definition/model.tmdl, or model.bim for TMSL) or a report folder (definition.pbir).', 'error');
     return;
   }
   // One project loads straight away. Several always ask which, rather than guessing.
@@ -3565,7 +3629,7 @@ function showProjectPicker(byPath, projects) {
     const [title, sub] = rs.length > 1
       ? [`All ${rs.length} reports on ${p.model.name}`, `${rs.map(r => r.name).join(', ')} — a field counts as used if any of them uses it`]
       : rs.length === 1
-        ? [rs[0].name, `report + semantic model ${p.model.name}${rs[0].pbip ? ` · opened by ${rs[0].pbip}` : ''}`]
+        ? [rs[0].name, `${p.model ? `report + semantic model ${p.model.name}${rs[0].link.matchedByName ? ' (live connection, matched by name)' : ''}` : `report only — ${reportLinkText(rs[0].link)}`}${rs[0].pbip ? ` · opened by ${rs[0].pbip}` : ''}`]
         : [p.model.name, 'semantic model only'];
     return `<button class="picker-item" data-idx="${i}"><span class="picker-title">${esc(title)}</span><span class="picker-sub">${esc(sub)}</span></button>`;
   };
@@ -3592,6 +3656,35 @@ function pickProject(i) {
   return project ? loadProject(pending.byPath, project) : undefined;
 }
 
+/* How a report whose model isn't in the project reaches one — for the picker, toast and Overview. */
+function reportLinkText(link) {
+  if (link && link.kind === 'byConnection') return `live connection to ${link.model || 'a semantic model'}${link.workspace ? ` in ${link.workspace}` : ''}`;
+  if (link && link.kind === 'byPath') return `its semantic model (${link.path}) isn't in this folder`;
+  return 'no semantic model found';
+}
+
+/* Legacy report-level measures: report.json's config.modelExtensions[].entities[].measures[], the
+   same shape as PBIR's reportExtensions.json. They're how a live-connected report adds measures,
+   since it can't change the model. */
+function parseLegacyReportMeasures(reportText) {
+  let cfg;
+  try {
+    const r = JSON.parse(reportText);
+    cfg = typeof r.config === 'string' ? JSON.parse(r.config) : (r.config || {});
+  } catch (e) { return []; }
+  const out = [];
+  for (const ext of (cfg.modelExtensions || [])) {
+    for (const ent of ((ext && ext.entities) || [])) {
+      for (const m of ((ent && ent.measures) || [])) {
+        if (!m || !m.name) continue;
+        out.push({ table: ent.name || '', name: m.name, dax: String(m.expression || '').trim(), displayFolder: m.displayFolder || '',
+          formatString: (m.formatInformation && m.formatInformation.formatString) || m.formatString || '' });
+      }
+    }
+  }
+  return out;
+}
+
 /* One report folder: PBIR (definition/pages/) or legacy (report.json). */
 async function parseReportFolder(byPath, report) {
   if (report.pagesRoot) {
@@ -3600,9 +3693,45 @@ async function parseReportFolder(byPath, report) {
   }
   if (report.legacyKey) {
     const text = await byPath[report.legacyKey].text();
-    return { pages: parseReport(text), references: extractAllReportReferences(text), reportMeasures: [], bookmarks: parseLegacyBookmarks(text) };
+    const references = extractAllReportReferences(text);
+    const reportMeasures = parseLegacyReportMeasures(text);
+    // As for PBIR: a report measure's DAX is an expression string the JSON walker can't see into.
+    for (const rm of reportMeasures) {
+      const { columns, measures } = parseDaxReferences(rm.dax, rm.table);
+      for (const r of [...columns, ...measures]) references.add(r);
+    }
+    return { pages: parseReport(text), references, reportMeasures, bookmarks: parseLegacyBookmarks(text) };
   }
   return { pages: [], references: new Set(), reportMeasures: [], bookmarks: [] };
+}
+
+/* A report whose model isn't in the project: live-connected (byConnection), or a byPath folder that
+   wasn't dropped. Everything the report holds still loads — pages, visuals, bookmarks, its
+   report-level measures — and the model tabs say where the model is instead of rejecting it. */
+async function loadReportOnly(byPath, report) {
+  showLoading('Parsing report pages…');
+  await nextPaint();
+  try {
+    Object.assign(App.state, {
+      projectName: report.name, modelFormat: '', projectReports: [report.name], liveReports: [], reportOnly: true, connection: report.link,
+      tables: [], expressions: {}, relationships: [], sources: [], modelAnnotations: {}, functions: [], roles: [], perspectives: [],
+    });
+    const res = await parseReportFolder(byPath, report);
+    Object.assign(App.state, { pages: res.pages, reportReferences: res.references, reportMeasures: res.reportMeasures, bookmarks: res.bookmarks, pageBookmark: {} });
+    buildUsageIndex();
+    App.els.emptyState.classList.add('hidden');
+    App.els.projectName.textContent = report.name;
+    App.els.projectName.classList.remove('empty');
+    updateCounts();
+    renderAll();
+    const n = res.pages.length, v = res.pages.reduce((sum, p) => sum + p.visuals.length, 0);
+    showToast(`Loaded report ${report.name}: ${n} page${n === 1 ? '' : 's'}, ${v} visual${v === 1 ? '' : 's'} — ${reportLinkText(report.link)}`, 'success');
+  } catch (err) {
+    console.error('Failed to load report:', err);
+    showToast('Failed to load: ' + (err && err.message ? err.message : err), 'error');
+  } finally {
+    hideLoading();
+  }
 }
 
 /* Load one discovered project: a model with one report, with every report that uses it, or alone.
@@ -3610,6 +3739,9 @@ async function parseReportFolder(byPath, report) {
    model.bim); TMDL is still a Desktop preview option, so both are live in the wild. */
 async function loadProject(byPath, project) {
   const { model, reports } = project;
+  if (!model) return loadReportOnly(byPath, reports[0]);
+  App.state.reportOnly = false;
+  App.state.connection = null;
   const isTmsl = model.format === 'TMSL';
   const smRoot = model.root;
   const bimKey = model.bimKey;
@@ -3617,6 +3749,7 @@ async function loadProject(byPath, project) {
   App.state.projectName = projectName;
   App.state.modelFormat = model.format;
   App.state.projectReports = reports.map(r => r.name);
+  App.state.liveReports = reports.filter(r => r.link.matchedByName).map(r => ({ name: r.name, model: r.link.model, workspace: r.link.workspace }));
 
   showLoading('Reading files…');
   await nextPaint();  // let the overlay paint before the heavy work starts
@@ -3821,14 +3954,19 @@ function countHiddenTables() {
 }
 
 function updateCounts() {
+  // A report-only project has no model: Measures counts the report's own measures, and the
+  // Unused tab becomes "Fields used", counting the model fields the report depends on.
+  const reportOnly = App.state.reportOnly;
   App.els.cSources.textContent = visibleSources().length;
   App.els.cTables.textContent = visibleTables().length;
-  App.els.cMeasures.textContent = countAllMeasures();
+  App.els.cMeasures.textContent = reportOnly ? (App.state.reportMeasures || []).length : countAllMeasures();
   const visNames = new Set(visibleTables().map(t => t.name));
   const visRels = App.state.relationships.filter(r => visNames.has(r.fromTable) && visNames.has(r.toTable));
   App.els.cRels.textContent = visRels.length;
   App.els.cPages.textContent = App.state.pages.length;
-  if (App.els.cUnused) App.els.cUnused.textContent = countUnused();
+  if (App.els.cUnused) App.els.cUnused.textContent = reportOnly ? reportFieldsUsed().length : countUnused();
+  const unusedTab = document.querySelector('.nav-tab[data-view="unused"]');
+  if (unusedTab && unusedTab.firstChild) unusedTab.firstChild.nodeValue = reportOnly ? 'Fields used ' : 'Unused ';
   // Update the hidden-tables toggle label
   if (App.els.hiddenToggleLabel) {
     const total = countHiddenTables();
@@ -3891,8 +4029,54 @@ async function handleDrop(e) {
 /* ═══════════════════════════════════════════════════════════════
    RENDERING — OVERVIEW
    ═══════════════════════════════════════════════════════════════ */
+/* One Overview tile; `view` makes it a link to that tab. Labels and subtitles are this file's
+   own text or numbers. */
+function tileHtml(t) {
+  return `
+    <div class="tile" data-goto="${t.view||''}">
+      <div class="tile-label"><span class="tile-dot" style="background:var(--${t.color})"></span>${t.label}</div>
+      <div class="tile-value">${t.value}</div>
+      <div class="tile-sub">${t.sub}</div>
+    </div>`;
+}
+
+/* The model tabs of a report-only project: where the model is, instead of an empty page. */
+function modelWhereHtml() {
+  const c = App.state.connection || {};
+  return c.kind === 'byConnection'
+    ? `This report is live-connected to <strong>${esc(c.model || 'a semantic model')}</strong>${c.workspace ? ` in <strong>${esc(c.workspace)}</strong>` : ''}; the model lives in the Power BI service, not in this project`
+    : `This report's semantic model${c.path ? ` (<code>${esc(c.path)}</code>)` : ''} isn't in the folder you dropped`;
+}
+function modelMissingHtml(what, tail) {
+  return `<div class="card" style="margin:24px"><div class="card-body" style="color:var(--text-2);line-height:1.55">${modelWhereHtml()}, so there are no ${what} to show. ${tail || 'The report\'s pages, bookmarks and report-level measures are all here, and <strong>Fields used</strong> lists what it needs from the model.'}</div></div>`;
+}
+
+/* Overview of a report-only project: the connection, then what the report itself holds. */
+function renderReportOnlyOverview(c) {
+  const s = App.state, cn = s.connection || {};
+  const visuals = s.pages.reduce((n, p) => n + p.visuals.length, 0);
+  const tiles = [
+    { label: 'Report Pages', value: s.pages.length, sub: `${visuals} visuals total`, color: 'pink', view: 'pages' },
+    { label: 'Bookmarks', value: (s.bookmarks || []).length, sub: 'show / hide and filter states', color: 'yellow', view: 'pages' },
+    { label: 'Report Measures', value: (s.reportMeasures || []).length, sub: 'defined in the report', color: 'purple', view: 'measures' },
+    { label: 'Model Fields Used', value: reportFieldsUsed().length, sub: 'what it needs from its model', color: 'blue', view: 'unused' },
+  ];
+  const rows = cn.kind === 'byConnection'
+    ? [['Connection', 'Live connection (byConnection)'], ['Semantic model', cn.model], ['Workspace', cn.workspace], ['Semantic model ID', cn.id]]
+    : [['Semantic model', cn.path ? `${cn.path} — not in this folder` : 'not found']];
+  c.innerHTML = `
+    <div class="tile-grid">${tiles.map(tileHtml).join('')}</div>
+    <div class="section-title">Semantic model</div>
+    <div class="card"><div class="card-body" style="display:flex;flex-direction:column;gap:6px">
+      ${rows.filter(([, v]) => v).map(([k, v]) => `<span><strong>${k}:</strong> ${esc(v)}</span>`).join('')}
+      <span style="color:var(--text-3);font-size:12px">A report-only project: the model's tables, measures and relationships aren't here, so the model tabs are empty and <strong>Fields used</strong> stands in for Unused.</span>
+    </div></div>`;
+  c.querySelectorAll('.tile[data-goto]').forEach(el => { el.style.cursor = 'pointer'; el.onclick = () => switchView(el.dataset.goto); });
+}
+
 function renderOverview() {
   const c = App.els.overviewContent;
+  if (App.state.reportOnly) { renderReportOnlyOverview(c); return; }
   if (!App.state.tables.length) { c.innerHTML = ''; return; }
   const totalCols = countAllColumns();
   const totalMeas = countAllMeasures();
@@ -3909,18 +4093,14 @@ function renderOverview() {
     {label:'Report Pages',value:App.state.pages.length, sub: `${App.state.pages.reduce((s,p)=>s+p.visuals.length,0)} visuals total`, color:'pink', view:'pages'},
     {label:'Columns',value:totalCols, sub:`across ${visTables.length} tables`, color:'green'},
   ];
-  const tilesHtml = tiles.map(t => `
-    <div class="tile" data-goto="${t.view||''}">
-      <div class="tile-label"><span class="tile-dot" style="background:var(--${t.color})"></span>${t.label}</div>
-      <div class="tile-value">${t.value}</div>
-      <div class="tile-sub">${t.sub}</div>
-    </div>
-  `).join('');
+  const tilesHtml = tiles.map(tileHtml).join('');
 
   const ann = App.state.modelAnnotations;
   const meta = [];
   const reportNames = App.state.projectReports || [];
   if (reportNames.length > 1) meta.push(`<span><strong>Reports (${reportNames.length}):</strong> ${esc(reportNames.join(', '))} — pages from all of them; a field counts as used if any uses it</span>`);
+  const live = App.state.liveReports || [];
+  if (live.length) meta.push(`<span><strong>Live-connected:</strong> ${live.map(r => `${esc(r.name)} (to ${esc(r.model)}${r.workspace ? ` in ${esc(r.workspace)}` : ''})`).join(', ')} — paired with this model because its name matches</span>`);
   if (ann.PBIDesktopVersion) meta.push(`<span><strong>Power BI Desktop:</strong> ${esc(ann.PBIDesktopVersion)}</span>`);
   if (ann.__PBI_TimeIntelligenceEnabled) meta.push(`<span><strong>Time intelligence:</strong> ${annIsTrue(ann.__PBI_TimeIntelligenceEnabled) ? 'enabled' : 'disabled'}</span>`);
   if (ann.PBI_ProTooling) meta.push(`<span><strong>Tooling:</strong> <code>${esc(ann.PBI_ProTooling)}</code></span>`);
@@ -3987,6 +4167,7 @@ function visibleSources() {
 
 function renderSources() {
   const c = App.els.sourcesContent;
+  if (App.state.reportOnly) { c.innerHTML = modelMissingHtml('data sources'); return; }
   const sources = visibleSources();
   if (!sources.length) { c.innerHTML = '<div class="card"><div class="card-body" style="color:var(--text-3)">No data sources to show</div></div>'; return; }
   c.innerHTML = sources.map((s, idx) => `
@@ -4032,6 +4213,7 @@ function renderSources() {
    ═══════════════════════════════════════════════════════════════ */
 function renderTables() {
   const c = App.els.tablesContent;
+  if (App.state.reportOnly) { c.innerHTML = modelMissingHtml('tables or columns'); return; }
   const vTables = visibleTables();
   if (!vTables.length) {
     if (!App.state.tables.length) {
@@ -4412,7 +4594,16 @@ function renderTableDetail() {
    ═══════════════════════════════════════════════════════════════ */
 function renderMeasures() {
   const c = App.els.measuresContent;
+  const reportOnly = App.state.reportOnly;
   const all = [];
+  // A report-only project has no model measures; its own (report-level) measures are listed instead.
+  if (reportOnly) {
+    if (!(App.state.reportMeasures || []).length) {
+      c.innerHTML = modelMissingHtml('model measures', 'The report defines no measures of its own either; <strong>Fields used</strong> lists the model measures and columns it needs.');
+      return;
+    }
+    all.push(...App.state.reportMeasures);
+  }
   for (const t of visibleTables()) {
     for (const m of t.measures) {
       all.push({ ...m, table: t.name });
@@ -4435,6 +4626,7 @@ function renderMeasures() {
   const groupList = Object.values(groups);
 
   c.innerHTML = `
+    ${reportOnly ? `<div style="color:var(--text-2);font-size:12px;margin-bottom:12px;line-height:1.55">Report-level measures: defined in this report, not its semantic model. ${modelWhereHtml()}, so the model's own measures aren't listed here.</div>` : ''}
     <div class="measures-toolbar">
       <input type="text" id="measureSearchInput" placeholder="Filter measures by name, table, folder, or DAX content..." value="${esc(filter)}">
       <span style="font-family:var(--mono);font-size:12px;color:var(--text-2)">${filtered.length} of ${all.length}</span>
@@ -4475,6 +4667,7 @@ function renderMeasures() {
    ═══════════════════════════════════════════════════════════════ */
 function renderRelationships() {
   const c = App.els.relationshipsContent;
+  if (App.state.reportOnly) { c.innerHTML = modelMissingHtml('relationships'); return; }
   if (!App.state.tables.length) { c.innerHTML = '<div style="padding:24px;color:var(--text-3)">No tables loaded</div>'; return; }
   c.innerHTML = `
     <div class="rel-layout">
@@ -5050,8 +5243,60 @@ function renderSinglePageDetail(root) {
 /* ═══════════════════════════════════════════════════════════════
    RENDERING — UNUSED
    ═══════════════════════════════════════════════════════════════ */
+/* What uses a field besides visuals — for Fields used and its export. */
+function fieldAlsoUsedBy(f) {
+  return [...[...f.measures].map(m => `report measure [${m}]`), ...(f.other ? ['filters, bookmarks or other settings'] : [])];
+}
+
+/* A report-only project's stand-in for Unused: without the model there's nothing to call unused,
+   but the fields the report depends on are exactly what whoever owns the model must keep. */
+function renderFieldsUsed(c) {
+  const filter = (App.state.unusedFilter || '').toLowerCase();
+  const all = reportFieldsUsed();
+  const shown = all.filter(f => !filter || `${f.table} ${f.field}`.toLowerCase().includes(filter));
+  const byTable = new Map();
+  for (const f of shown) byTable.set(f.table, [...(byTable.get(f.table) || []), f]);
+  c.innerHTML = `
+    <div class="usage-toolbar">
+      <input type="text" id="unusedFilterInput" placeholder="Filter by name or table..." value="${esc(filter)}" style="flex:1;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:5px;font-family:var(--mono);font-size:12px;outline:none">
+      <span style="font-family:var(--mono);color:var(--text-2);font-size:12px"><strong>${shown.length}</strong> of ${all.length} fields</span>
+    </div>
+
+    <div style="color:var(--text-2);font-size:12px;margin-bottom:18px;line-height:1.55">
+      ${modelWhereHtml()}, so there's no telling what in it is unused. Instead, these are the model fields this report depends on — bound in a visual, used by a filter, bookmark or other setting, or referenced by a report-level measure. Removing one from the model breaks this report.
+    </div>
+
+    ${!byTable.size ? `<div class="card"><div class="card-body" style="color:var(--text-3)">${all.length ? 'No fields match the filter.' : 'This report uses no model fields.'}</div></div>` : `
+    <div class="unused-section">
+      <div class="unused-section-title">
+        Fields used
+        <span style="background:var(--bg-3);color:var(--text-2);padding:1px 8px;border-radius:10px;font-size:11px;font-family:var(--mono);font-weight:600">${shown.length}</span>
+      </div>
+      ${[...byTable].map(([table, items]) => `
+        <div class="unused-table-group">
+          <div class="unused-table-group-head" style="cursor:default">
+            <span><span class="dot blue" style="margin-right:8px"></span>${esc(table)}</span>
+            <span style="font-family:var(--mono);font-size:11px;color:var(--text-2)">${items.length} field${items.length === 1 ? '' : 's'}</span>
+          </div>
+          <div class="unused-items">
+            ${items.map(f => {
+              const why = [f.visuals ? `${f.visuals} visual${f.visuals === 1 ? '' : 's'}` : '', ...fieldAlsoUsedBy(f)].filter(Boolean).join('; ');
+              return `<span class="unused-item" style="cursor:default" title="${esc(why)}">${esc(f.field)}<span class="reason">— ${esc(why)}</span></span>`;
+            }).join('')}
+          </div>
+        </div>
+      `).join('')}
+    </div>`}
+  `;
+  const fi = document.getElementById('unusedFilterInput');
+  if (fi) {
+    fi.oninput = () => { App.state.unusedFilter = fi.value; renderUnused(); setTimeout(()=>{ const n=document.getElementById('unusedFilterInput'); if(n){n.focus(); n.setSelectionRange(n.value.length,n.value.length);}}, 0); };
+  }
+}
+
 function renderUnused() {
   const c = App.els.unusedContent;
+  if (App.state.reportOnly) { renderFieldsUsed(c); return; }
   if (!App.state.usage) {
     c.innerHTML = '<div class="card"><div class="card-body" style="color:var(--text-3)">Load a PBIP folder first.</div></div>';
     return;
@@ -5195,7 +5440,8 @@ function renderNotes() {
     <h3>2.1 Finding the projects in a dropped folder</h3>
     <ul>
       <li><strong>By their files, not folder names.</strong> A model is any folder holding <code>definition/model.tmdl</code> (TMDL) or <code>model.bim</code> (TMSL) — named <code>X.SemanticModel</code>, <code>X.Dataset</code> (older projects; microsoft/finops-toolkit still ships them) or anything else, as Fabric Git exports can be. A report is any folder holding <code>definition.pbir</code>, or a <code>*.Report</code> folder with <code>report.json</code> / <code>definition/pages/</code>.</li>
-      <li><strong>Paired by the report's own link.</strong> <code>definition.pbir</code> → <code>datasetReference.byPath.path</code> is resolved relative to the report folder (<code>..</code> climbs; matched case-insensitively, as Windows paths are). Only <code>definition.pbir</code> counts; alternates such as <code>definition-liveConnect.pbir</code> are ignored, as Fabric Git ignores them. A report without a <code>definition.pbir</code> pairs with the folder's only model.</li>
+      <li><strong>Paired by the report's own link.</strong> <code>definition.pbir</code> → <code>datasetReference.byPath.path</code> is resolved relative to the report folder (<code>..</code> climbs; matched case-insensitively, as Windows paths are). Only <code>definition.pbir</code> counts; alternates such as <code>definition-liveConnect.pbir</code> are ignored, as Fabric Git ignores them. A report without a <code>definition.pbir</code> pairs with the folder's only model. A live connection (<code>byConnection</code>) names its model in the connection string's <code>initial catalog</code>; Fabric Git writes one even when that model is in the same export (microsoft/fabric-toolbox's <code>FCA_Core_Report</code> → <code>FCA_Core_SM</code>), so the report pairs with the model here of that name — its folder's, or the <code>displayName</code> in its <code>.platform</code> — when exactly one matches. The Overview then says the report is live-connected and was paired by name.</li>
+      <li><strong>A report whose model isn't here opens on its own.</strong> Live-connected to a model in the service, or a <code>byPath</code> model folder that wasn't dropped: its pages, visuals, bookmarks and report-level measures all load. The Overview shows the connection (workspace, model, semantic model ID from <code>semanticmodelid</code> or <code>pbiModelDatabaseName</code>); Sources, Tables and Relationships say where the model is; Measures lists the report's own measures; and Unused becomes <strong>Fields used</strong> — every model field the report depends on. The export follows suit.</li>
       <li><strong>One project loads straight away; several always ask.</strong> The picker lists every model shared by several reports as <em>All N reports on Model</em> first — pages from all of them, with each page's name prefixed by its report and field usage pooled, so the Unused tab means unused by every report — then each report with its model (the one a <code>.pbip</code> opens first), then models no report uses.</li>
     </ul>
 
@@ -5421,7 +5667,7 @@ function renderNotes() {
         <tr><td>sortByColumn</td><td>column property pointing at another column (quoted names are unquoted before lookup)</td><td>Structural</td></tr>
         <tr><td><strong>Hierarchy level</strong></td><td><code>level X { column: Y }</code> inside a <code>hierarchy</code> block — the referenced column is kept alive by the hierarchy</td><td>Structural</td></tr>
         <tr><td><strong>Row-level security</strong></td><td><code>roles/*.tmdl</code> &rarr; <code>tablePermission T = &lt;DAX&gt;</code>. The filter DAX is parsed with the same reference extractor as measure DAX; an unqualified column (<code>[Country] == "Canada"</code>, the usual way RLS filters are written) resolves to the guarded table. Counted as <em>direct</em>, not structural: a column an RLS rule filters on is load-bearing — drop it and the model stops securing rows.</td><td>Direct</td></tr>
-        <tr><td><strong>Report-level measures</strong></td><td>PBIR <code>definition/reportExtensions.json</code> &rarr; <code>entities[].measures[].expression</code>. These measures live in the report, not the model, so their DAX is often the only reference to a model column.</td><td>Direct</td></tr>
+        <tr><td><strong>Report-level measures</strong></td><td>PBIR <code>definition/reportExtensions.json</code> &rarr; <code>entities[].measures[].expression</code>; legacy <code>report.json</code> &rarr; <code>config.modelExtensions[].entities[].measures[]</code>. These measures live in the report, not the model, so their DAX is often the only reference to a model column.</td><td>Direct</td></tr>
         <tr><td><strong>Report-level filters</strong></td><td>PBIR <code>definition/report.json</code> — walked by the same recursive extractor as pages and visuals</td><td>Direct</td></tr>
         <tr><td><strong>Bookmarks</strong></td><td>PBIR <code>definition/bookmarks/*.bookmark.json</code> — a bookmark captures filter and slicer state, which can be the only place a field is referenced</td><td>Direct</td></tr>
         <tr><td><strong>DAX user-defined function</strong></td><td><code>functions.tmdl</code> &rarr; <code>function F = &lt;DAX&gt;</code>. Call sites aren't tracked, so a reference inside any UDF body counts — the same safe-side bias the rest of the detection takes.</td><td>Direct</td></tr>
@@ -5486,6 +5732,7 @@ function renderNotes() {
       <li>Walks <code>sections[]</code> → pages, each with <code>visualContainers[]</code> → visuals</li>
       <li>Visual type from <code>config.singleVisual.visualType</code> (config is stringified JSON, parsed on the fly)</li>
       <li>Field bindings from <code>config.singleVisual.projections[role][].queryRef</code></li>
+      <li>Report-level measures from <code>config.modelExtensions[].entities[].measures[]</code> — the legacy form of PBIR's <code>reportExtensions.json</code>, and how a live-connected report adds measures to a model it can't change</li>
       <li>Dimensions (width/height) extracted for display</li>
       <li>Page flags from the section's stringified <code>config</code>: <code>visibility: 1</code> = hidden in view mode, <code>type: 1</code> = tooltip page, <code>type: 2</code> = drillthrough. Some older drillthrough pages have no <code>type</code>, only a drillthrough filter (<code>howCreated: 5</code>); tooltip pages carry those too, so the filter alone isn't read as a kind.</li>
       <li>Per visual: ID from <code>config.name</code> (what bookmarks call it), hidden from <code>singleVisual.display.mode === "hidden"</code>, title from <code>singleVisual.vcObjects.title</code>, parent group from <code>config.parentGroupName</code>. A <code>singleVisualGroup</code> container is a <em>group</em> (name, <code>isHidden</code>), not a visual — it no longer counts as an "unknown" visual.</li>
@@ -5520,6 +5767,7 @@ function renderNotes() {
       <li><strong>RLS / row-level security roles</strong> — not surfaced.</li>
       <li><strong>Translations / cultures</strong> — present in TMDL but not displayed.</li>
       <li><strong>Detail rows expressions</strong>, <strong>KPI goals</strong>, <strong>perspectives</strong> — not surfaced.</li>
+      <li><strong>A live connection is paired by name.</strong> A model folder with the name the connection gives is taken to be the connected model; the connection's workspace and semantic model ID can't be checked against a folder, so a same-named copy (say, a dev model) would be paired too. The Overview says when a report was paired this way.</li>
       <li><strong>Bookmarks</strong> — a cell is what applying the bookmark does, read from the file; "—" means it leaves the visual in whatever state it's in, which PBIP can't tell you (it depends on what was clicked before). Filter state a bookmark captures is used for field references but not shown. <strong>Themes</strong> aren't parsed.</li>
     </ul>
 
@@ -6149,7 +6397,7 @@ function switchView(name) {
   // (which is self-contained docs) so users can read the doc without loading a folder.
   // Show it again on other tabs if no folder is loaded.
   if (App.els.emptyState) {
-    const hasFolder = App.state.tables.length > 0;
+    const hasFolder = App.state.tables.length > 0 || App.state.reportOnly;
     if (hasFolder || name === 'notes') {
       App.els.emptyState.classList.add('hidden');
     } else {
@@ -6195,7 +6443,13 @@ function buildMarkdownExport(o) {
 
   const tables = o.includeHidden ? s.tables : visibleTables();
 
-  if (o.aiPreamble) {
+  if (o.aiPreamble && s.reportOnly) {
+    push('> **Context for an AI assistant:** Below is an export of a Power BI report generated by PBIP'
+       + ' Explorer. Its semantic model is not part of the project, so the model\'s tables, measures and'
+       + ' relationships are not included. It documents the report pages and visuals, bookmarks,'
+       + ' report-level measures (DAX), and the model fields the report uses.');
+    push('');
+  } else if (o.aiPreamble) {
     push('> **Context for an AI assistant:** Below is a complete export of a Power BI semantic model'
        + ' (and its report) generated by PBIP Explorer. Use it as reference context when answering'
        + ' questions or proposing changes. It documents tables, columns, measures (DAX), relationships,'
@@ -6209,7 +6463,20 @@ function buildMarkdownExport(o) {
   push('');
 
   // ── Summary ──
-  if (o.summary) {
+  if (o.summary && s.reportOnly) {
+    // A report-only project: say where its model is, then what the report itself holds.
+    const c = s.connection || {};
+    push('## Summary', '');
+    push(c.kind === 'byConnection'
+      ? `Live connection to **${c.model || 'a semantic model'}**${c.workspace ? ` in **${c.workspace}**` : ''}${c.id ? ` (semantic model ID \`${c.id}\`)` : ''} — the model isn't part of this project, so this documents the report.`
+      : `This report's semantic model${c.path ? ` (\`${c.path}\`)` : ''} isn't in this folder, so this documents the report.`, '');
+    push('| Metric | Count |', '|---|---|');
+    push(`| Report pages | ${s.pages.length} (${s.pages.reduce((a, p) => a + p.visuals.length, 0)} visuals) |`);
+    push(`| Bookmarks | ${(s.bookmarks || []).length} |`);
+    push(`| Report-level measures | ${(s.reportMeasures || []).length} |`);
+    push(`| Model fields used | ${reportFieldsUsed().length} |`);
+    push('');
+  } else if (o.summary) {
     const hidden = countHiddenTables();
     push('## Summary');
     push('');
@@ -6246,7 +6513,7 @@ function buildMarkdownExport(o) {
   }
 
   // ── Tables & columns (schema; measures get their own section) ──
-  if (o.tables) {
+  if (o.tables && !s.reportOnly) {
     push('## Tables', '');
     for (const t of tables) {
       const kind = TABLE_KIND_LABEL[tableKind(t)] || 'Table';
@@ -6299,6 +6566,22 @@ function buildMarkdownExport(o) {
           if (m.formatString) push(`Format: \`${m.formatString}\``);
           push('```dax', String(m.dax || '').trim(), '```', '');
         }
+      }
+    }
+  }
+
+  // ── Report-level measures — defined in the report, which is how a live-connected report adds
+  //    measures, since it can't change its model ──
+  if (o.measures && (s.reportMeasures || []).length) {
+    push('## Report-level measures', '', '_Defined in the report, not the semantic model._', '');
+    const byTable = new Map();
+    for (const m of s.reportMeasures) byTable.set(m.table, [...(byTable.get(m.table) || []), m]);
+    for (const [table, ms] of byTable) {
+      push(`### ${table || '(no table)'}`, '');
+      for (const m of ms) {
+        push(`#### ${m.name}${m.displayFolder ? ` _(${m.displayFolder})_` : ''}`);
+        if (m.formatString) push(`Format: \`${m.formatString}\``);
+        push('```dax', String(m.dax || '').trim(), '```', '');
       }
     }
   }
@@ -6419,8 +6702,19 @@ function buildMarkdownExport(o) {
     if (orphans.length) { push('### Bookmarks without a matching page', ''); bookmarkTable(orphans); }
   }
 
+  // ── Fields this report uses — a report-only project's stand-in for Unused ──
+  if (o.unused && s.reportOnly) {
+    push('## Fields this report uses', '',
+      '_Every semantic-model field the report depends on: bound in visuals, used by filters, bookmarks or other settings, or referenced by a report-level measure. Removing one from the model breaks this report._', '');
+    push('| Table | Field | Visuals | Also used by |', '|---|---|---|---|');
+    for (const f of reportFieldsUsed()) {
+      push(`| ${mdCell(f.table)} | ${mdCell(f.field)} | ${f.visuals} | ${mdCell(fieldAlsoUsedBy(f).join('; '))} |`);
+    }
+    push('');
+  }
+
   // ── Unused ──
-  if (o.unused) {
+  if (o.unused && !s.reportOnly) {
     const uCols = [], uMeas = [];
     const visSet = new Set(visibleTables().map(t => t.name));
     if (s.usage) {
@@ -6450,7 +6744,8 @@ const EXPORT_DETAILS = [
 
 function renderExport() {
   const c = App.els.exportContent;
-  if (!App.state.tables.length) {
+  const reportOnly = App.state.reportOnly;
+  if (!App.state.tables.length && !reportOnly) {
     c.innerHTML = '<div class="card"><div class="card-body" style="color:var(--text-3)">Load a PBIP folder first.</div></div>';
     return;
   }
@@ -6465,7 +6760,7 @@ function renderExport() {
 
   c.innerHTML = `
     <div style="color:var(--text-2);font-size:13px;margin-bottom:14px;line-height:1.55">
-      A single Markdown document describing the whole model. Use it as an <strong>AI prompt</strong>,
+      A single Markdown document describing the whole ${reportOnly ? 'report (its model isn\'t in this project)' : 'model'}. Use it as an <strong>AI prompt</strong>,
       a quick reference, or to <strong>copy all measures</strong> at once. Toggle sections below, then copy or download.
     </div>
 
@@ -6477,7 +6772,7 @@ function renderExport() {
     </div>
 
     <div class="usage-toolbar" style="flex-wrap:wrap;gap:8px">
-      ${EXPORT_SECTIONS.map(([k, l]) => toggleHtml(k, l)).join('')}
+      ${EXPORT_SECTIONS.map(([k, l]) => toggleHtml(k, reportOnly && k === 'unused' ? 'Fields used' : l)).join('')}
     </div>
     <div class="usage-toolbar" style="flex-wrap:wrap;gap:8px;margin-top:8px">
       ${EXPORT_DETAILS.map(([k, l]) => toggleHtml(k, l)).join('')}

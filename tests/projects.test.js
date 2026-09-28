@@ -1,13 +1,13 @@
 // Finding projects in a dropped folder: models and reports are recognised by their definition
 // files, not their folder names, and each report is paired with the model its definition.pbir
 // names. Layouts mirror real repos: microsoft/finops-toolkit (five reports sharing one
-// Shared.Dataset model), Fabric Git exports with bare "SemanticModel" folders, and Power BI's own
-// side-by-side projects.
+// Shared.Dataset model), Fabric Git exports with bare "SemanticModel" folders or live-connected
+// reports beside their model (microsoft/fabric-toolbox), and Power BI's own side-by-side projects.
 'use strict';
 const { loadApp, fileList, eq, has, defined, suite } = require('./harness');
 const { tests, test } = suite();
 
-const NAMES = ['App', 'processFiles', 'discoverProjects', 'pickProject', 'usageStatus', 'buildMarkdownExport'];
+const NAMES = ['App', 'processFiles', 'discoverProjects', 'pickProject', 'usageStatus', 'buildMarkdownExport', 'renderOverview'];
 
 const model = (root, table, cols) => ({
   [`${root}/definition.pbism`]: { version: '4.0' },
@@ -97,6 +97,33 @@ test('a report the .pbip opens is listed before the others', async () => {
     'P/Z.pbip': { version: '1.0', artifacts: [{ report: { path: 'Z.Report' } }] },
   }));
   eq(projects.map(p => [p.reports[0].name, p.reports[0].pbip]), [['Z', 'Z.pbip'], ['A', '']], 'order');
+});
+
+// Fabric Git writes reports byConnection even when their model is in the same export.
+const byConn = (model) => ({ byConnection: { connectionString: `Data Source=powerbi://api.powerbi.com/v1.0/myorg/Focus;initial catalog=${model};integrated security=ClaimsToken`,
+  pbiModelDatabaseName: '26c9f0b0-fc20-4eaf-8309-b38bba897b6e', connectionType: 'pbiServiceXmlaStyleLive' } });
+const platform = (root, displayName) => ({ [`${root}/.platform`]: { metadata: { type: 'SemanticModel', displayName }, config: { version: '2.0', logicalId: '00000000-0000-0000-0000-000000000000' } } });
+
+test('a live-connected report pairs with the model its connection names, when that model is here (fabric-toolbox FCA)', async () => {
+  const app = await load({ ...model('src/FCA_Core_SM.SemanticModel', 'Costs', ['Amount', 'Spare']), ...platform('src/FCA_Core_SM.SemanticModel', 'FCA'),
+    ...report('src/FCA_Core_Report.Report', byConn('FCA_Core_SM'), 'Costs.Amount') });
+  eq(app.toasts, ['Loaded 1 tables, 0 measures, 0 relationships'], 'loaded as one project');
+  eq([app.App.state.reportOnly, app.App.state.pages.length], [false, 1], 'state');
+  eq(['Costs.Amount', 'Costs.Spare'].map(app.usageStatus), ['used', 'unused'], 'usage');
+  eq(app.App.state.liveReports, [{ name: 'FCA_Core_Report', model: 'FCA_Core_SM', workspace: 'Focus' }], 'noted as live-connected');
+  defined(app.renderOverview, 'renderOverview')();
+  has(app.App.els.overviewContent.innerHTML, '<strong>Live-connected:</strong> FCA_Core_Report (to FCA_Core_SM in Focus)');
+});
+
+test("the model's .platform display name matches too; no match, or two matches, stays report-only", async () => {
+  const app = loadApp(NAMES, { dom: true });
+  const pairs = async (files) => (await app.discoverProjects(asByPath(files))).map(p => [p.reports.map(r => r.name), p.model && p.model.root]);
+  eq(await pairs({ ...model('ws/Sales.SemanticModel', 'T', ['c']), ...platform('ws/Sales.SemanticModel', 'Sales Model'),
+    ...report('ws/R.Report', byConn('sales model'), 'T.c') }), [[['R'], 'ws/Sales.SemanticModel']], 'display name, any case');
+  eq(await pairs({ ...model('ws/Sales.SemanticModel', 'T', ['c']), ...report('ws/R.Report', byConn('Finance'), 'T.c') }),
+    [[['R'], null], [[], 'ws/Sales.SemanticModel']], 'no match');
+  eq(await pairs({ ...model('dev/Sales.SemanticModel', 'T', ['c']), ...model('prod/Sales.SemanticModel', 'T', ['c']),
+    ...report('dev/R.Report', byConn('Sales'), 'T.c') }), [[['R'], null], [[], 'dev/Sales.SemanticModel'], [[], 'prod/Sales.SemanticModel']], 'ambiguous');
 });
 
 test('a folder with no model or report says what it expected', async () => {

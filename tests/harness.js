@@ -36,7 +36,7 @@ function domGlobals(toasts) {
         Object.defineProperty(el, 'innerHTML', { get() { return escapeText(el._text); }, set(v) { el._html = v; } });
         return el;
       },
-      getElementById: () => null, querySelectorAll: () => [], addEventListener() {},
+      getElementById: () => null, querySelector: () => null, querySelectorAll: () => [], addEventListener() {},
       body: { appendChild: el => toasts.push(el._text) },
     },
     requestAnimationFrame: cb => setTimeout(cb, 0),
