@@ -1991,11 +1991,17 @@ function parseRelationships(text) {
   return rels;
 }
 
+/* Split a TMDL `Table.Column` reference, as relationships.tmdl writes fromColumn / toColumn. Either
+   half is single-quoted when its name holds a space, dot, colon, equals or apostrophe, and an
+   apostrophe inside a quoted name is doubled: `'Client''s Spend'.'Order Date'`. The quotes are
+   TMDL syntax, not part of the name. The column half used to keep them, so `Sales.'Order Date'`
+   yielded a column named 'Order Date' — quotes included — that matched nothing: any relationship
+   key whose name needs quoting (any name with a space) lost its structural mark and read as
+   unused, an invitation to delete a key the relationship depends on. */
 function splitTableColumn(ref) {
-  // e.g. "Sales.ProductKey" or "'Salesperson (Performance)'.EmployeeKey"
-  const m = ref.match(/^('([^']+)'|([^.]+))\.(.+)$/);
+  const m = String(ref || '').trim().match(/^('(?:[^']|'')+'|[^.']+)\.(.+)$/);
   if (!m) return [ref, ''];
-  return [m[2] || m[3], m[4]];
+  return [unquote(m[1]), unquote(m[2])];
 }
 
 /* ── Reference extraction (for usage analysis) ── */
@@ -2017,31 +2023,71 @@ function parseQueryRef(ref) {
   return { table: (m[1] || m[2]).trim(), field };
 }
 
-function parseDaxReferences(dax) {
-  if (!dax) return { columns: new Set(), measures: new Set() };
+/* Model tables a DAX expression names, 'quoted' or as a bare identifier. String literals, comments
+   and [bracketed] names are skipped: an apostrophe inside "It's" must not open a phantom quoted
+   name, and a measure called [Sales Amount] doesn't name a table called Sales. */
+function daxTablesNamed(dax, byName) {
+  const found = new Set();
+  const re = /"(?:[^"]|"")*"|\/\/[^\n]*|--[^\n]*|\/\*[\s\S]*?\*\/|\[(?:[^\]]|\]\])*\]|'((?:[^']|'')+)'|([A-Za-z_]\w*)/g;
+  let m;
+  while ((m = re.exec(dax))) {
+    const name = m[1] !== undefined ? m[1].replace(/''/g, "'") : m[2];
+    if (name !== undefined && byName.has(name)) found.add(name);
+  }
+  return found;
+}
+
+/* Columns and measures a DAX expression references. `homeTable` is the table the expression lives
+   on — a measure's or calculated column's table, or the table an RLS filter guards — which is
+   where an unqualified [Name] looks for its column. */
+function parseDaxReferences(dax, homeTable) {
   const cols = new Set();
   const meas = new Set();
-  // Table[Field] or 'Table'[Field]
-  const refRe = /(?:'([^']+)'|([A-Za-z_]\w*))\[([^\]]+)\]/g;
+  if (!dax) return { columns: cols, measures: meas };
+  const byName = new Map(App.state.tables.map(t => [t.name, t]));
+  // Table[Field] or 'Table'[Field] — an apostrophe inside a quoted name is doubled: 'Client''s Spend'
+  const refRe = /(?:'((?:[^']|'')+)'|([A-Za-z_]\w*))\[([^\]]+)\]/g;
   let m;
   while ((m = refRe.exec(dax))) {
-    const tbl = (m[1] || m[2]).trim();
+    const tbl = m[1] !== undefined ? m[1].replace(/''/g, "'").trim() : m[2];
     const fld = m[3].trim();
-    const key = `${tbl}.${fld}`;
-    const t = App.state.tables.find(x => x.name === tbl);
+    const t = byName.get(tbl);
     if (t) {
-      if (t.columns.find(c => c.name === fld)) cols.add(key);
-      if (t.measures.find(mm => mm.name === fld)) meas.add(key);
+      if (t.columns.some(c => c.name === fld)) cols.add(`${tbl}.${fld}`);
+      if (t.measures.some(mm => mm.name === fld)) meas.add(`${tbl}.${fld}`);
     }
   }
-  // Bare [MeasureName] — find which table owns it
+  // Bare [Name]. A measure is always referenced this way, but so is a column wherever a row context
+  // supplies the table — the norm in calculated columns ([Qty] * [Price]) and RLS filters
+  // ([Country] == "Canada"), and common inside iterators (FILTER(Sales, [Cost] > x)). Resolving bare
+  // names only to measures reported the columns behind all of those as unused; for an RLS filter,
+  // the very column that secures the rows. Which row context applies can't be known without a real
+  // DAX parser, so look for the column on the home table and on every table the expression names,
+  // and if none of them has it, mark every column of that name: the reference binds to one of them,
+  // and over-marking is the safe direction.
   const bareRe = /(?<![A-Za-z0-9_'\]])\[([^\]]+)\]/g;
+  let candidates = null;
   while ((m = bareRe.exec(dax))) {
     const name = m[1].trim();
+    let isMeasure = false;
     for (const t of App.state.tables) {
-      if (t.measures.find(mm => mm.name === name)) {
+      if (t.measures.some(mm => mm.name === name)) {
         meas.add(`${t.name}.${name}`);
+        isMeasure = true;
         break;
+      }
+    }
+    if (!candidates) {
+      candidates = daxTablesNamed(dax, byName);
+      if (byName.has(homeTable)) candidates.add(homeTable);
+    }
+    let found = false;
+    for (const tn of candidates) {
+      if (byName.get(tn).columns.some(c => c.name === name)) { cols.add(`${tn}.${name}`); found = true; }
+    }
+    if (!found && !isMeasure) {
+      for (const t of App.state.tables) {
+        if (t.columns.some(c => c.name === name)) cols.add(`${t.name}.${name}`);
       }
     }
   }
@@ -2591,7 +2637,7 @@ async function parsePbirReport(byPath, pagesRoot) {
   // Report-level measure DAX references model objects by name, which the JSON walker above
   // can't see — it's an expression string, not a structured binding.
   for (const rm of reportMeasures) {
-    const { columns, measures } = parseDaxReferences(rm.dax);
+    const { columns, measures } = parseDaxReferences(rm.dax, rm.table);
     for (const r of columns) references.add(r);
     for (const r of measures) references.add(r);
   }
@@ -2854,7 +2900,7 @@ function buildUsageIndex() {
   //     as a direct use, not structural, because there is nothing optional about it.
   for (const role of (App.state.roles || [])) {
     for (const tp of (role.tablePermissions || [])) {
-      const { columns, measures } = parseDaxReferences(tp.dax);
+      const { columns, measures } = parseDaxReferences(tp.dax, tp.table);
       for (const k of [...columns, ...measures]) {
         if (byKey[k]) byKey[k].direct.push(`RLS role "${role.name}"`);
       }
@@ -2882,41 +2928,60 @@ function buildUsageIndex() {
     }
   }
 
-  // 5. Transitive — DAX references, propagated from used measures AND used calculated columns.
-  //    Calculated columns are DAX-defined just like measures, so their references should also propagate.
+  // 5. Transitive — DAX references, propagated from used measures, used calculated columns and the
+  //    items of calculation groups in use. Calculated columns are DAX-defined just like measures, so
+  //    their references propagate the same way. A calculation item isn't a field of its own: it
+  //    takes effect through its group's column (the one a slicer or visual puts on the page), so its
+  //    DAX, expression and format string alike, propagates once any column of the group's table is
+  //    used. Leaving items out reported a column referenced only inside one (a fiscal
+  //    DATESYTD('Fiscal'[Date]), a currency format lookup) as unused while its calculation group
+  //    was plainly in use.
   const exprDax = {};   // key → { columns: Set, measures: Set }
   const exprLabel = {}; // key → display label for the "reason" string
+  const calcItemDax = []; // { table, label, refs: [{ columns, measures }, ...] }
   for (const t of App.state.tables) {
     for (const m of t.measures) {
       const k = `${t.name}.${m.name}`;
-      exprDax[k] = parseDaxReferences(m.dax);
+      exprDax[k] = parseDaxReferences(m.dax, t.name);
       exprLabel[k] = `[${m.name}]`;
     }
     for (const c of t.columns) {
       if (c.calcDax) {
         const k = `${t.name}.${c.name}`;
-        exprDax[k] = parseDaxReferences(c.calcDax);
+        exprDax[k] = parseDaxReferences(c.calcDax, t.name);
         exprLabel[k] = `calc col [${c.name}]`;
       }
+    }
+    for (const ci of (t.calcItems || [])) {
+      calcItemDax.push({
+        table: t,
+        label: `calc item [${ci.name}]`,
+        refs: [parseDaxReferences(ci.dax, t.name), parseDaxReferences(ci.formatStringDefinition, t.name)],
+      });
     }
   }
   const isUsed = (k) => {
     const e = byKey[k];
     return e && (e.direct.length > 0 || e.transitive.length > 0);
   };
+  // Record `reason` on every entity in `refs` that doesn't carry it yet; true if anything changed.
+  const propagate = (refs, reason) => {
+    let added = false;
+    for (const k of [...refs.columns, ...refs.measures]) {
+      if (byKey[k] && !byKey[k].transitive.includes(reason)) { byKey[k].transitive.push(reason); added = true; }
+    }
+    return added;
+  };
   let changed = true, iter = 0;
   while (changed && iter < 100) {
     changed = false; iter++;
     for (const key of Object.keys(exprDax)) {
-      if (!isUsed(key)) continue;
-      const refs = exprDax[key];
-      if (!refs) continue;
-      const reason = `referenced by ${exprLabel[key]}`;
-      for (const ck of refs.columns) {
-        if (byKey[ck] && !byKey[ck].transitive.includes(reason)) { byKey[ck].transitive.push(reason); changed = true; }
-      }
-      for (const mk of refs.measures) {
-        if (byKey[mk] && !byKey[mk].transitive.includes(reason)) { byKey[mk].transitive.push(reason); changed = true; }
+      if (isUsed(key) && propagate(exprDax[key], `referenced by ${exprLabel[key]}`)) changed = true;
+    }
+    for (const item of calcItemDax) {
+      if (!item.table.columns.some(c => isUsed(`${item.table.name}.${c.name}`))) continue;
+      for (const refs of item.refs) {
+        if (propagate(refs, `referenced by ${item.label}`)) changed = true;
       }
     }
   }
@@ -4541,7 +4606,7 @@ function renderUnused() {
     </div>
 
     <div style="color:var(--text-2);font-size:12px;margin-bottom:18px;line-height:1.55">
-      "Unused" means nothing references this entity — no visual binding, no report filter, no DAX expression (in any used measure or calculated column), no M code of any used table, and no field-parameter <code>NAMEOF</code>. ${includeStructural ? 'Items shown as "structural only" are referenced by relationships, sortBy, or hierarchies — usually safe to keep.' : 'Toggle "Show structural-only" to also see items referenced solely by relationships, sortBy columns, or hierarchy levels (usually safe to keep).'}
+      "Unused" means nothing references this entity — no visual binding, no report filter, no DAX expression (in any used measure, calculated column, or calculation item), no M code of any used table, and no field-parameter <code>NAMEOF</code>. ${includeStructural ? 'Items shown as "structural only" are referenced by relationships, sortBy, or hierarchies — usually safe to keep.' : 'Toggle "Show structural-only" to also see items referenced solely by relationships, sortBy columns, or hierarchy levels (usually safe to keep).'}
     </div>
 
     ${renderUnusedSection('Unused Columns', unusedCols, 'column', false)}
@@ -4853,13 +4918,14 @@ function renderNotes() {
         <tr><td>Direct <code>{Entity, Property}</code> pair</td><td>rare but legal; caught for completeness</td><td>Direct</td></tr>
         <tr><td>Name in Select clauses</td><td><code>{ Column: {...}, Name: "Sales.Profit" }</code> — the <code>Name</code> string is parsed as a queryRef too</td><td>Direct</td></tr>
         <tr><td>Filters, sort, conditional formatting, drillthrough, etc.</td><td>all use the structured Column/Measure pattern above and are caught by the recursive walker, including when nested inside stringified JSON in <code>config</code> / <code>filters</code> / <code>dataTransforms</code></td><td>Direct</td></tr>
-        <tr><td>DAX of a used measure or calculated column</td><td><code>Table[Col]</code>, <code>'Table'[Col]</code>, bare <code>[Measure]</code> in the DAX of any used measure <em>or used calculated column</em>. Calc-columns are DAX-defined just like measures, so their references propagate the same way.</td><td>Transitive (iterative)</td></tr>
+        <tr><td>DAX of a used measure or calculated column</td><td><code>Table[Col]</code>, <code>'Table'[Col]</code>, bare <code>[Measure]</code> in the DAX of any used measure <em>or used calculated column</em>. Calc-columns are DAX-defined just like measures, so their references propagate the same way. A bare <code>[Name]</code> that isn't a measure is a column in a row context — <code>[Qty] * [Price]</code> in a calculated column, <code>FILTER(Sales, [Cost] &gt; x)</code> in a measure — so it's looked up on the expression's own table and on every table the expression names; if none of them has it, every column of that name counts (safe side).</td><td>Transitive (iterative)</td></tr>
+        <tr><td>DAX of a calculation item</td><td>Each item's expression and <code>formatStringDefinition</code>, once any column of the calculation group's table is used — an item has no field of its own and applies through the group's column. Catches e.g. a <code>LOOKUPVALUE('Dynamic Measure'[Format], …)</code> dynamic format string.</td><td>Transitive (iterative)</td></tr>
         <tr><td>M code of another used table</td><td>used table's partition M mentions another table by name <em>and</em> references a column via <code>"ColName"</code> (e.g. join keys / <code>SelectColumns</code>), <code>[ColName]</code>, or <code>#"ColName"</code>. <strong>Scalar exception:</strong> if the referenced table has exactly one column and is referenced by bare name only, the sole column is marked used (see <strong>9.3</strong>).</td><td>Transitive (iterative)</td></tr>
         <tr><td>Field parameter NAMEOF</td><td>calculated table's DAX has <code>NAMEOF('Table'[Col])</code>; when the parameter table is used in a visual, NAMEOF'd source fields are transitively used</td><td>Transitive</td></tr>
-        <tr><td>Relationships</td><td><code>relationships.tmdl</code> from/to columns</td><td>Structural</td></tr>
+        <tr><td>Relationships</td><td><code>relationships.tmdl</code> from/to columns (TMDL quoting stripped: <code>Sales.'Order Date'</code> &rarr; <code>Order Date</code>)</td><td>Structural</td></tr>
         <tr><td>sortByColumn</td><td>column property pointing at another column (quoted names are unquoted before lookup)</td><td>Structural</td></tr>
         <tr><td><strong>Hierarchy level</strong></td><td><code>level X { column: Y }</code> inside a <code>hierarchy</code> block — the referenced column is kept alive by the hierarchy</td><td>Structural</td></tr>
-        <tr><td><strong>Row-level security</strong></td><td><code>roles/*.tmdl</code> &rarr; <code>tablePermission T = &lt;DAX&gt;</code>. The filter DAX is parsed with the same reference extractor as measure DAX. Counted as <em>direct</em>, not structural: a column an RLS rule filters on is load-bearing — drop it and the model stops securing rows.</td><td>Direct</td></tr>
+        <tr><td><strong>Row-level security</strong></td><td><code>roles/*.tmdl</code> &rarr; <code>tablePermission T = &lt;DAX&gt;</code>. The filter DAX is parsed with the same reference extractor as measure DAX; an unqualified column (<code>[Country] == "Canada"</code>, the usual way RLS filters are written) resolves to the guarded table. Counted as <em>direct</em>, not structural: a column an RLS rule filters on is load-bearing — drop it and the model stops securing rows.</td><td>Direct</td></tr>
         <tr><td><strong>Report-level measures</strong></td><td>PBIR <code>definition/reportExtensions.json</code> &rarr; <code>entities[].measures[].expression</code>. These measures live in the report, not the model, so their DAX is often the only reference to a model column.</td><td>Direct</td></tr>
         <tr><td><strong>Report-level filters</strong></td><td>PBIR <code>definition/report.json</code> — walked by the same recursive extractor as pages and visuals</td><td>Direct</td></tr>
         <tr><td><strong>Bookmarks</strong></td><td>PBIR <code>definition/bookmarks/*.bookmark.json</code> — a bookmark captures filter and slicer state, which can be the only place a field is referenced</td><td>Direct</td></tr>

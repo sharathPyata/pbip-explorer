@@ -148,11 +148,11 @@ Multiple expressions pointing to the same host collapse into one source card.
 
 The **Unused** tab classifies each column / measure into:
 
-- **Used** — referenced by a visual binding, filter, DAX expression, or M code of a used table; by a **row-level-security filter**; by a **report-level measure**; by a **bookmark's** captured state; or by a **DAX user-defined function** body
+- **Used** — referenced by a visual binding, filter, DAX expression, or M code of a used table; by a **row-level-security filter**; by a **report-level measure**; by a **bookmark's** captured state; by a **calculation item** (expression or format string) of a calculation group in use; or by a **DAX user-defined function** body
 - **Structural only** — referenced only by relationships, `sortByColumn`, hierarchy levels, or **perspective membership** (usually safe to keep)
 - **Unused** — no references anywhere
 
-Detection is regex-based and errs on the safe side: if a column name appears in an unrelated string literal, it'll be counted as used.
+Detection is regex-based and errs on the safe side: if a column name appears in an unrelated string literal, it'll be counted as used. A column referenced without its table — `[Qty] * [Price]` in a calculated column, `[Country] = "Canada"` in an RLS filter — is matched to the expression's own table or a table it names, and to every column of that name when neither has it.
 
 ---
 
