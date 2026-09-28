@@ -237,6 +237,22 @@ body {
   backdrop-filter: blur(2px);
   z-index: 50;
 }
+.picker-box {
+  display: flex; flex-direction: column; gap: 8px;
+  width: min(560px, calc(100% - 32px)); max-height: 80vh; overflow: auto;
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: 12px;
+  padding: 20px 22px; box-shadow: 0 10px 40px rgba(0,0,0,0.25);
+}
+.picker-head { font-weight: 600; font-size: 15px; color: var(--text); margin-bottom: 4px; }
+.picker-item {
+  display: flex; flex-direction: column; gap: 2px; text-align: left; cursor: pointer;
+  padding: 10px 12px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--bg); font-family: var(--sans); color: var(--text);
+}
+.picker-item:hover, .picker-item:focus-visible { border-color: var(--accent-2); background: var(--bg-hover); outline: none; }
+.picker-title { font-weight: 600; font-size: 13px; }
+.picker-sub { font-size: 12px; color: var(--text-2); }
+.picker-cancel { align-self: flex-end; margin-top: 6px; }
 .loading-box {
   display: flex; flex-direction: column; align-items: center; gap: 16px;
   background: var(--bg-2);
@@ -1149,6 +1165,8 @@ tr.row-unused td:first-child { font-style: italic; }
       <div class="hint">Expected structure: <code>MyReport.pbip</code> + <code>MyReport.Report/</code> + <code>MyReport.SemanticModel/</code></div>
     </div>
   </div>
+
+  <div class="loading-overlay" id="projectPicker" style="display:none"></div>
 
   <div class="loading-overlay" id="loadingOverlay" style="display:none">
     <div class="loading-box">
@@ -3391,6 +3409,116 @@ function countUnused() {
 }
 
 /* ═══════════════════════════════════════════════════════════════
+   PROJECT DISCOVERY
+   ═══════════════════════════════════════════════════════════════
+   A dropped folder can hold one project or several: Power BI saves reports and models side by
+   side, Fabric Git exports a whole workspace into one folder, and microsoft/finops-toolkit ships
+   five reports sharing one model. Items are recognised by the files that define them, not by
+   folder name — Power BI writes X.SemanticModel / X.Report, but older projects and some tools use
+   X.Dataset, and Fabric Git or scripts can use anything — and each report is paired with the model
+   its definition.pbir names. Taking the first *.SemanticModel and the first *.Report instead
+   rejected every X.Dataset project and paired reports with the wrong model. */
+
+/* Resolve a relative path (definition.pbir's byPath, a .pbip's report path) against a folder of
+   the dropped tree. Both separators are accepted; `..` climbs. */
+function resolveRelativePath(base, rel) {
+  const out = base ? base.split('/') : [];
+  for (const seg of String(rel || '').split(/[\\/]/)) {
+    if (!seg || seg === '.') continue;
+    if (seg === '..') out.pop(); else out.push(seg);
+  }
+  return out.join('/');
+}
+
+/* A live connection's workspace, model and ID, from definition.pbir's byConnection connectionString:
+   Data Source="powerbi://api.powerbi.com/v1.0/myorg/<workspace>";initial catalog=<model>;…;semanticmodelid=<id> */
+function parseConnectionString(cs) {
+  const parts = {};
+  for (const m of String(cs || '').matchAll(/\s*([^=;]+?)\s*=\s*("(?:[^"]|"")*"|[^;]*)\s*(?:;|$)/g)) {
+    let v = m[2].trim();
+    if (v.startsWith('"') && v.endsWith('"') && v.length > 1) v = v.slice(1, -1).replace(/""/g, '"');
+    parts[m[1].toLowerCase()] = v;
+  }
+  const dataSource = parts['data source'] || '';
+  let workspace = (dataSource.match(/\/myorg\/([^/;]+)\/?$/i) || [])[1] || '';
+  try { workspace = decodeURIComponent(workspace); } catch (e) {}
+  return { workspace, model: parts['initial catalog'] || '', id: parts['semanticmodelid'] || '', dataSource };
+}
+
+/* Every project in the dropped tree, as { model, reports } choices in the order the picker lists
+   them: a model with ALL the reports that use it (when there are several), then each report with
+   its model (the ones a .pbip opens first), then models no report uses. `model` is null for a
+   report whose model isn't here — live-connected (byConnection), or a byPath folder not dropped. */
+async function discoverProjects(byPath) {
+  const keys = Object.keys(byPath);
+  const readJson = async (k) => {
+    try { return JSON.parse((await byPath[k].text()).replace(/^﻿/, '')); } catch (e) { return null; }
+  };
+  const nameOf = (root, suffix) => root.split('/').pop().replace(suffix, '');
+
+  // Models: a folder holding definition/model.tmdl (TMDL) or model.bim (TMSL); TMDL wins if both.
+  const models = new Map();
+  for (const k of keys) {
+    let m = k.match(/^(.+)\/definition\/model\.tmdl$/);
+    if (m) { models.set(m[1], { root: m[1], name: nameOf(m[1], /\.(SemanticModel|Dataset)$/), format: 'TMDL' }); continue; }
+    m = k.match(/^(.+)\/model\.bim$/);
+    if (m && !models.has(m[1])) models.set(m[1], { root: m[1], name: nameOf(m[1], /\.(SemanticModel|Dataset)$/), format: 'TMSL', bimKey: k });
+  }
+  const findModel = (root) => models.get(root) || [...models.values()].find(m => m.root.toLowerCase() === root.toLowerCase()) || null;
+
+  // Reports: a folder holding definition.pbir — required in every report folder — or, for
+  // projects saved without one, a *.Report folder holding report.json or definition/pages/.
+  const roots = new Set();
+  for (const k of keys) {
+    const m = k.match(/^(.+)\/definition\.pbir$/) || k.match(/^(.+\.Report)\/report\.json$/)
+      || k.match(/^(.+\.Report)\/definition\/pages\/(?:pages\.json|[^/]+\/page\.json)$/);
+    if (m) roots.add(m[1]);
+  }
+  const reports = [];
+  for (const root of roots) {
+    const pagesRe = new RegExp(`^${escRe(root)}/definition/pages/(?:pages\\.json|[^/]+/page\\.json)$`);
+    const report = {
+      root, name: nameOf(root, /\.Report$/), pbip: '', model: null, link: { kind: 'none' },
+      pagesRoot: keys.some(k => pagesRe.test(k)) ? `${root}/definition/pages` : null,
+      legacyKey: byPath[`${root}/report.json`] ? `${root}/report.json` : null,
+    };
+    const pbir = byPath[`${root}/definition.pbir`] ? await readJson(`${root}/definition.pbir`) : null;
+    const ref = (pbir && pbir.datasetReference) || {};
+    if (ref.byPath && ref.byPath.path) {
+      report.link = { kind: 'byPath', path: String(ref.byPath.path) };
+      report.model = findModel(resolveRelativePath(root, ref.byPath.path));
+    } else if (ref.byConnection) {
+      const c = parseConnectionString(ref.byConnection.connectionString);
+      report.link = { kind: 'byConnection', ...c, id: c.id || ref.byConnection.pbiModelDatabaseName || '' };
+    }
+    reports.push(report);
+  }
+  // A report with no definition.pbir says nothing about its model; with exactly one model in the
+  // folder, that's the one — how projects without a definition.pbir have always loaded.
+  if (models.size === 1) for (const r of reports) if (r.link.kind === 'none') r.model = [...models.values()][0];
+
+  // A .pbip names the report it opens, which makes that report the project's main one.
+  for (const k of keys.filter(k => /\.pbip$/i.test(k))) {
+    const pbip = await readJson(k);
+    const dir = k.includes('/') ? k.slice(0, k.lastIndexOf('/')) : '';
+    for (const a of ((pbip && pbip.artifacts) || [])) {
+      const target = a && a.report && a.report.path ? resolveRelativePath(dir, a.report.path).toLowerCase() : '';
+      const r = target && reports.find(x => x.root.toLowerCase() === target);
+      if (r && !r.pbip) r.pbip = k.split('/').pop();
+    }
+  }
+
+  const order = (a, b) => (b.pbip ? 1 : 0) - (a.pbip ? 1 : 0) || a.name.localeCompare(b.name);
+  const byModel = new Map();
+  for (const r of reports) if (r.model) byModel.set(r.model, [...(byModel.get(r.model) || []), r]);
+  const projects = [];
+  for (const [model, rs] of byModel) if (rs.length > 1) projects.push({ model, reports: rs.slice().sort(order) });
+  for (const r of reports.slice().sort(order)) projects.push({ model: r.model, reports: [r] });
+  for (const m of models.values()) if (!byModel.has(m)) projects.push({ model: m, reports: [] });
+  return projects;
+}
+
+/* ═══════════════════════════════════════════════════════════════
    FILE LOADING
    ═══════════════════════════════════════════════════════════════ */
 
@@ -3415,23 +3543,80 @@ async function processFiles(fileList) {
     const path = f.webkitRelativePath || f._path || f.name;
     byPath[path] = f;
   }
-  // Find a SemanticModel folder
-  // A semantic model is stored in ONE of two formats: TMDL (definition/*.tmdl) or TMSL
-  // (a single model.bim). TMDL is still a Desktop preview option, so both are live in the
-  // wild and both are supported — pick whichever this project actually uses.
-  const smKey = Object.keys(byPath).find(k => /\.SemanticModel\/definition\/model\.tmdl$/.test(k));
-  const bimKey = Object.keys(byPath).find(k => /\.SemanticModel\/model\.bim$/.test(k));
-  if (!smKey && !bimKey) {
-    showToast('No semantic model found — expected a .SemanticModel folder containing either definition/model.tmdl (TMDL) or model.bim (TMSL).', 'error');
+  const found = await discoverProjects(byPath);
+  const projects = found.filter(p => p.model);
+  if (!projects.length) {
+    showToast(found.length
+      ? 'Found a report but not its semantic model — report-only projects aren\'t supported yet.'
+      : 'No Power BI project found — expected a semantic model folder (definition/model.tmdl, or model.bim for TMSL), usually with a report folder (definition.pbir).', 'error');
     return;
   }
-  const isTmsl = !smKey;
-  const smRoot = isTmsl
-    ? bimKey.replace(/\/model\.bim$/, '')
-    : smKey.replace(/\/definition\/model\.tmdl$/, '');
-  const projectName = smRoot.split('/').pop().replace(/\.SemanticModel$/, '');
+  // One project loads straight away. Several always ask which, rather than guessing.
+  if (projects.length === 1) return loadProject(byPath, projects[0]);
+  showProjectPicker(byPath, projects);
+}
+
+/* Several projects in one folder: list them and load the one picked. Choices are identified by
+   their index, so no file text goes into an attribute. */
+function showProjectPicker(byPath, projects) {
+  App.pendingProjects = { byPath, projects };
+  const item = (p, i) => {
+    const rs = p.reports;
+    const [title, sub] = rs.length > 1
+      ? [`All ${rs.length} reports on ${p.model.name}`, `${rs.map(r => r.name).join(', ')} — a field counts as used if any of them uses it`]
+      : rs.length === 1
+        ? [rs[0].name, `report + semantic model ${p.model.name}${rs[0].pbip ? ` · opened by ${rs[0].pbip}` : ''}`]
+        : [p.model.name, 'semantic model only'];
+    return `<button class="picker-item" data-idx="${i}"><span class="picker-title">${esc(title)}</span><span class="picker-sub">${esc(sub)}</span></button>`;
+  };
+  const el = App.els.projectPicker;
+  el.innerHTML = `
+    <div class="picker-box" role="dialog" aria-label="Choose a project">
+      <div class="picker-head">This folder holds ${projects.length} projects — which one should open?</div>
+      ${projects.map(item).join('')}
+      <button class="btn small picker-cancel">Cancel</button>
+    </div>`;
+  el.style.display = 'flex';
+  el.querySelectorAll('.picker-item').forEach(b => { b.onclick = () => pickProject(Number(b.dataset.idx)); });
+  const cancel = el.querySelector('.picker-cancel');
+  if (cancel) cancel.onclick = hideProjectPicker;
+}
+function hideProjectPicker() {
+  App.pendingProjects = null;
+  if (App.els.projectPicker) App.els.projectPicker.style.display = 'none';
+}
+function pickProject(i) {
+  const pending = App.pendingProjects;
+  hideProjectPicker();
+  const project = pending && pending.projects[i];
+  return project ? loadProject(pending.byPath, project) : undefined;
+}
+
+/* One report folder: PBIR (definition/pages/) or legacy (report.json). */
+async function parseReportFolder(byPath, report) {
+  if (report.pagesRoot) {
+    const r = await parsePbirReport(byPath, report.pagesRoot);
+    return { pages: r.pages, references: r.references, reportMeasures: r.reportMeasures || [], bookmarks: r.bookmarks || [] };
+  }
+  if (report.legacyKey) {
+    const text = await byPath[report.legacyKey].text();
+    return { pages: parseReport(text), references: extractAllReportReferences(text), reportMeasures: [], bookmarks: parseLegacyBookmarks(text) };
+  }
+  return { pages: [], references: new Set(), reportMeasures: [], bookmarks: [] };
+}
+
+/* Load one discovered project: a model with one report, with every report that uses it, or alone.
+   A semantic model is stored in ONE of two formats, TMDL (definition/*.tmdl) or TMSL (a single
+   model.bim); TMDL is still a Desktop preview option, so both are live in the wild. */
+async function loadProject(byPath, project) {
+  const { model, reports } = project;
+  const isTmsl = model.format === 'TMSL';
+  const smRoot = model.root;
+  const bimKey = model.bimKey;
+  const projectName = reports.length > 1 ? `${model.name} · ${reports.length} reports` : model.name;
   App.state.projectName = projectName;
-  App.state.modelFormat = isTmsl ? 'TMSL' : 'TMDL';
+  App.state.modelFormat = model.format;
+  App.state.projectReports = reports.map(r => r.name);
 
   showLoading('Reading files…');
   await nextPaint();  // let the overlay paint before the heavy work starts
@@ -3571,35 +3756,25 @@ async function processFiles(fileList) {
   }
   App.state.sources = Object.values(sourcesByKey);
 
-  // Parse report — detect PBIR (per-file) first; fall back to PBIR-Legacy (single report.json).
-  // PBIR is detected by the definition/pages/ folder, identified via pages.json OR any
-  // [pageName]/page.json under it (pages.json is optional per the PBIR spec). We capture the
-  // pages-root folder path so parsePbirReport doesn't depend on pages.json existing.
-  let pbirPagesRoot = null;
-  for (const k of Object.keys(byPath)) {
-    const m = k.match(/^(.*\.Report\/definition\/pages)\/(?:pages\.json|[^/]+\/page\.json)$/);
-    if (m) { pbirPagesRoot = m[1]; break; }
+  // Parse the report(s) — PBIR (per-file) when a definition/pages/ folder exists (pages.json is
+  // optional per the spec), else the legacy report.json. Several reports on one model are listed
+  // together: a page's name gets its report as a prefix, since page IDs repeat across reports (a
+  // legacy report's first page is often plain "ReportSection"), with pageId keeping the real ID
+  // for the export. Their field references are pooled, so Unused means unused by every report.
+  setLoadingText('Parsing report pages…');
+  const parsed = [];
+  for (const r of reports) parsed.push(await parseReportFolder(byPath, r));
+  if (reports.length > 1) {
+    parsed.forEach((res, i) => {
+      const rn = reports[i].name;
+      for (const p of res.pages) { p.pageId = p.name; p.report = rn; p.name = `${rn}/${p.name}`; p.displayName = `${rn} · ${p.displayName}`; }
+      for (const b of res.bookmarks) { b.page = `${rn}/${b.page}`; b.report = rn; }
+    });
   }
-  const legacyKey = Object.keys(byPath).find(k => /\.Report\/report\.json$/.test(k));
-  if (pbirPagesRoot) {
-    setLoadingText('Parsing report pages…');
-    const { pages, references, reportMeasures, bookmarks } = await parsePbirReport(byPath, pbirPagesRoot);
-    App.state.pages = pages;
-    App.state.reportReferences = references;
-    App.state.reportMeasures = reportMeasures || [];
-    App.state.bookmarks = bookmarks || [];
-  } else if (legacyKey) {
-    const text = await byPath[legacyKey].text();
-    App.state.pages = parseReport(text);
-    App.state.reportReferences = extractAllReportReferences(text);
-    App.state.reportMeasures = [];
-    App.state.bookmarks = parseLegacyBookmarks(text);
-  } else {
-    App.state.pages = [];
-    App.state.reportReferences = new Set();
-    App.state.reportMeasures = [];
-    App.state.bookmarks = [];
-  }
+  App.state.pages = parsed.flatMap(res => res.pages);
+  App.state.reportReferences = new Set(parsed.flatMap(res => [...res.references]));
+  App.state.reportMeasures = parsed.flatMap(res => res.reportMeasures);
+  App.state.bookmarks = parsed.flatMap(res => res.bookmarks);
   App.state.pageBookmark = {};
 
   // Roles and perspectives also reference model objects, and nothing else in the project
@@ -3744,6 +3919,8 @@ function renderOverview() {
 
   const ann = App.state.modelAnnotations;
   const meta = [];
+  const reportNames = App.state.projectReports || [];
+  if (reportNames.length > 1) meta.push(`<span><strong>Reports (${reportNames.length}):</strong> ${esc(reportNames.join(', '))} — pages from all of them; a field counts as used if any uses it</span>`);
   if (ann.PBIDesktopVersion) meta.push(`<span><strong>Power BI Desktop:</strong> ${esc(ann.PBIDesktopVersion)}</span>`);
   if (ann.__PBI_TimeIntelligenceEnabled) meta.push(`<span><strong>Time intelligence:</strong> ${annIsTrue(ann.__PBI_TimeIntelligenceEnabled) ? 'enabled' : 'disabled'}</span>`);
   if (ann.PBI_ProTooling) meta.push(`<span><strong>Tooling:</strong> <code>${esc(ann.PBI_ProTooling)}</code></span>`);
@@ -4846,7 +5023,7 @@ function renderSinglePageDetail(root) {
       <span class="source-type-badge other">page</span>
       <span style="font-weight:600;font-size:16px">${esc(p.displayName || p.name)}</span>${pageFlagsHtml(p)}
       ${p.width && p.height ? `<span style="font-family:var(--mono);font-size:12px;color:var(--text-3)">${p.width}×${p.height} px</span>` : ''}
-      <span style="font-family:var(--mono);font-size:11px;color:var(--text-3)">${esc(p.name)}</span>
+      <span style="font-family:var(--mono);font-size:11px;color:var(--text-3)">${esc(p.pageId || p.name)}</span>
       <span class="source-count" style="margin-left:auto">${countLabel}</span>
     </div>
 
@@ -5000,9 +5177,9 @@ function renderNotes() {
 
     <h2>2. File structure it reads</h2>
     <pre>MyReport/
-├── MyReport.pbip                          ← project metadata (not deeply used)
+├── MyReport.pbip                          ← names the report it opens (listed first when choosing)
 ├── MyReport.Report/
-│   ├── definition.pbir                    ← references the SemanticModel folder
+│   ├── definition.pbir                    ← its model: byPath (a folder) or byConnection (live)
 │   └── report.json                        ← pages, visuals, field projections, filters
 └── MyReport.SemanticModel/
     └── definition/
@@ -5014,6 +5191,13 @@ function renderNotes() {
             ├── Sales.tmdl                 ← one file per table
             ├── 'Date'.tmdl
             └── ...</pre>
+
+    <h3>2.1 Finding the projects in a dropped folder</h3>
+    <ul>
+      <li><strong>By their files, not folder names.</strong> A model is any folder holding <code>definition/model.tmdl</code> (TMDL) or <code>model.bim</code> (TMSL) — named <code>X.SemanticModel</code>, <code>X.Dataset</code> (older projects; microsoft/finops-toolkit still ships them) or anything else, as Fabric Git exports can be. A report is any folder holding <code>definition.pbir</code>, or a <code>*.Report</code> folder with <code>report.json</code> / <code>definition/pages/</code>.</li>
+      <li><strong>Paired by the report's own link.</strong> <code>definition.pbir</code> → <code>datasetReference.byPath.path</code> is resolved relative to the report folder (<code>..</code> climbs; matched case-insensitively, as Windows paths are). Only <code>definition.pbir</code> counts; alternates such as <code>definition-liveConnect.pbir</code> are ignored, as Fabric Git ignores them. A report without a <code>definition.pbir</code> pairs with the folder's only model.</li>
+      <li><strong>One project loads straight away; several always ask.</strong> The picker lists every model shared by several reports as <em>All N reports on Model</em> first — pages from all of them, with each page's name prefixed by its report and field usage pooled, so the Unused tab means unused by every report — then each report with its model (the one a <code>.pbip</code> opens first), then models no report uses.</li>
+    </ul>
 
     <h2>3. TMDL parsing — edge cases covered</h2>
 
@@ -6173,7 +6357,7 @@ function buildMarkdownExport(o) {
       const dim = p.width && p.height ? ` _(${p.width}×${p.height})_` : '';
       const flags = [p.hidden ? 'hidden' : '', (p.kind || '').toLowerCase()].filter(Boolean);
       push(`### ${p.displayName || p.name}${dim}${flags.map(f => ` · ${f}`).join('')}`, '');
-      push(`Page ID: \`${p.name}\``, '');
+      push(`Page ID: \`${p.pageId || p.name}\``, '');
       const groups = p.groups || [];
       const groupsById = new Map(groups.map(g => [g.id, g]));
       const groupName = (id) => { const g = groupsById.get(id); return g ? (g.name || g.id) : ''; };
@@ -6372,6 +6556,7 @@ function init() {
   App.els.emptyState = document.getElementById('emptyState');
   App.els.loadingOverlay = document.getElementById('loadingOverlay');
   App.els.loadingText = document.getElementById('loadingText');
+  App.els.projectPicker = document.getElementById('projectPicker');
   App.els.projectName = document.getElementById('projectName');
   App.els.folderInput = document.getElementById('folderInput');
   App.els.loadBtn = document.getElementById('loadBtn');
@@ -6452,6 +6637,7 @@ function init() {
       App.els.globalSearch.select();
     }
     if (e.key === 'Escape') {
+      if (App.pendingProjects) hideProjectPicker();
       App.els.searchPanel.classList.remove('visible');
       App.els.globalSearch.blur();
     }

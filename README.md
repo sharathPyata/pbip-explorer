@@ -92,6 +92,8 @@ My report/
 
 PBIP Explorer reads **both** semantic-model formats. TMDL (`.SemanticModel/definition/*.tmdl`, a folder of text files) and TMSL (`.SemanticModel/model.bim`, a single JSON file) are auto-detected — TMDL is still a Power BI Desktop preview option, so plenty of projects are saved as TMSL, and both load identically. Both report formats are auto-detected: the legacy single `.Report/report.json` and the newer **PBIR** per-file format (`.Report/definition/pages/[pageName]/visuals/[visualName]/visual.json`) introduced in 2026.
 
+You can drop a folder holding **several projects**. Models and reports are found by their files rather than their folder names, so `X.Dataset` (older projects, still used by e.g. microsoft/finops-toolkit) and suffix-less folders from Fabric Git work too. Each report is paired with the model its `definition.pbir` names. One project opens straight away; with several you pick which, and a model shared by several reports can open with **all of them** — their pages side by side, and a field counts as used if any report uses it.
+
 ---
 
 ## Views
