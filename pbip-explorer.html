@@ -2638,6 +2638,14 @@ function parameterLiteral(sourceM) {
   const m = String(sourceM || '').trim().match(/^"((?:[^"]|"")*)"\s*(?:meta\b[\s\S]*)?$/);
   return m ? m[1].replace(/""/g, '"') : null;
 }
+/* Whether a shared expression is a parameter of any type: a string literal as above, or any value
+   whose `meta [...]` record ends the expression with IsParameterQuery=true — a number, date/time,
+   logical or null (incremental refresh's RangeStart / RangeEnd are date/time ones). Only a text
+   one has a value a connector can use, so only those are inlined. */
+function isParameterQuery(sourceM) {
+  return parameterLiteral(sourceM) !== null
+    || /\bmeta\s*\[[^\]]*\bIsParameterQuery\s*=\s*true\b[^\]]*\]\s*$/.test(String(sourceM || ''));
+}
 
 function inlineMParameters(mCode, expressions) {
   if (!mCode || !expressions) return mCode || '';
@@ -4113,8 +4121,11 @@ async function loadProject(byPath, project) {
     // A parameter (`expression Server = "host" meta [IsParameterQuery=true]`) is a scalar
     // input to other queries, not a connection. Seeding one created a phantom "Unknown"
     // source card holding no tables, inflating the source count on every model that
-    // parameterises its connections — which is most of them.
-    if (parameterLiteral(edata.sourceM) !== null) continue;
+    // parameterises its connections — which is most of them. Checking for a text value only
+    // left number, date/time, logical and null ones there: incremental refresh's RangeStart /
+    // RangeEnd alone still made that card, and finops-toolkit's storage model listed six
+    // parameters among its Unknown queries.
+    if (isParameterQuery(edata.sourceM)) continue;
     const info = fromM(inlineMParameters(edata.sourceM, App.state.expressions));
     const key = sourceGroupKey(info);
     const src = ensureSource(info, key);

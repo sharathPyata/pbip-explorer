@@ -5,7 +5,8 @@
 // ```m block. Shapes from RuiRomano/powerbi-agentic-apm-demo (a text parameter feeding Web.Contents),
 // microsoft/fabric-toolbox's FCA model (a query), microsoft/Analysis-Services' SamplePBIP (a
 // queryGroup; a /// description right after the previous expression's properties) and
-// microsoft/finops-toolkit (a function TMDL fences because a line ends in a space).
+// microsoft/finops-toolkit (a function TMDL fences because a line ends in a space). A parameter of
+// any type is an input to queries, not a data source.
 'use strict';
 const { loadApp, fileList, eq, has, hasNot, suite } = require('./harness');
 const { tests, test } = suite();
@@ -81,6 +82,35 @@ test('parameters still feed their connectors; the Sources tab and the export sho
   eq(fences, fences.map((l, k) => (k % 2 ? '```' : '```m')), 'every ```m block closes once');
   hasNot(html, '```');
   for (const text of [html, sources]) for (const prop of ['lineageTag', 'queryGroup', 'annotation']) hasNot(text, prop);
+});
+
+test('a number, date/time, logical or null parameter gets no source card and isn\'t counted', async () => {
+  const app = loadApp(['App', 'processFiles', 'renderOverview', 'buildMarkdownExport'], { dom: true });
+  await app.processFiles(fileList({
+    'P.SemanticModel/definition/model.tmdl': 'model Model\n\tculture: en-US\n',
+    'P.SemanticModel/definition/expressions.tmdl': [   // SamplePBIP, finops-toolkit, FHSQLMonitor
+      'expression RangeStart = #datetime(2020, 1, 1, 0, 0, 0) meta [IsParameterQuery=true, List={#datetime(2020, 1, 1, 0, 0, 0)}, DefaultValue=#datetime(2020, 1, 1, 0, 0, 0), Type="DateTime", IsParameterQueryRequired=true]',
+      '\tlineageTag: a1a6bc94-b59e-4ec1-9b6d-cd637ebafff5', '',
+      'expression RangeEnd = null meta [IsParameterQuery=true, Type="DateTime", IsParameterQueryRequired=false]',
+      '\tlineageTag: 695f1d3b-7b1a-49fa-8d83-f2c25dc787de', '',
+      'expression Randomizer = 0.6 meta [IsParameterQuery=true, Type="Number", IsParameterQueryRequired=true]',
+      '\tlineageTag: c92d2f56-fbbe-4162-b5ce-373932bf5cf2', '',
+      "expression 'Remove Duplicate Resource IDs' = false meta [IsParameterQuery=true, List={false, true}, DefaultValue=false, Type=\"Logical\", IsParameterQueryRequired=true]",
+      '\tlineageTag: 8874e3dd-ace8-4145-bc74-acb63aa36684', '',
+      "expression 'Data load list' = null meta [IsParameterQuery=true, Type=\"Text\", IsParameterQueryRequired=false]",
+      '\tlineageTag: 138f92da-e0a3-496b-b21b-5836c9211f38', '',
+    ].join('\n'),
+    'P.SemanticModel/definition/tables/Sales.tmdl': m('Sales', ['let', '    Source = Sql.Database("sql.contoso.com", "SalesDb"),',
+      '    Sales = Source{[Schema="dbo",Item="Sales"]}[Data],',
+      '    Filtered = Table.SelectRows(Sales, each [OrderDate] >= RangeStart and [OrderDate] < RangeEnd)', 'in', '    Filtered']),
+  }));
+  const s = app.App.state;
+  eq(s.sources.map(src => [src.type, src.server, src.queries, src.expressions.map(e => e.name)]),
+    [['sql-server', 'sql.contoso.com / SalesDb', ['Sales'], []]], 'sources');
+  app.renderOverview();
+  const tile = app.App.els.overviewContent.innerHTML.match(/Data Sources<\/div>\s*<div class="tile-value">(\d+)</);
+  eq([tile && tile[1], app.App.els.cSources.textContent], ['1', '1'], 'Overview tile, Sources badge');
+  has(app.buildMarkdownExport({ summary: true }), '| Data sources | 1 |');
 });
 
 module.exports = tests;
