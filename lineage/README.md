@@ -7,14 +7,15 @@ parser (`pbip-explorer.html`, unchanged). It needs Node and nothing to install.
 
 ## Running it
 
-1. **Extract.** A script reads the model and traces every column it can trace exactly:
+1. **Extract.** A script reads the model, traces every column it can trace exactly and classifies
+   the simple measures:
 
    ```bash
    node lineage/extract.js "C:\path\to\MyProject"
    ```
 
    It writes `lineage-output/MyProject/<Model>/`, holding `model.json` and `tasks/*.json`: the
-   columns it couldn't trace, and the measures to classify.
+   columns it couldn't trace, and the measures it couldn't classify.
 
 2. **Answer the tasks.** An AI answers each task file, following
    [INSTRUCTIONS.md](INSTRUCTIONS.md), into `answers/`. In VS Code with Claude Code, ask:
@@ -29,15 +30,20 @@ parser (`pbip-explorer.html`, unchanged). It needs Node and nothing to install.
 
    It writes `<Model>-lineage.xlsx` next to `model.json`, and prints anything left unresolved.
 
+**After the model changes,** run the three steps again. The answers in `answers/` stay: only the
+measures and columns whose DAX or queries changed, and the ones never answered, become new tasks.
+When [INSTRUCTIONS.md](INSTRUCTIONS.md)'s rules version goes up, everything is asked again. To start
+over, delete the model's output folder.
+
 ## The workbook
 
 | Sheet | One row per | Columns |
 |---|---|---|
-| **Lineage** | measure × field × source | measure, main or helper and how it's used, model field, the measures or calculated columns it came through, connector, system, schema, table, source column, how it was traced (exact / renamed / derived / assumed / unresolved), note, traced by (extractor or AI), check |
+| **Lineage** | measure × field × source | measure, main or helper and how it's used, model field, the measures or calculated columns it came through, connector, system, schema, table, source column, how it was traced (exact / renamed / derived / assumed / unresolved), note, classified by and traced by (extractor or AI), check |
 | **By source field** | main source field + set of helper fields | source field, helper fields, the measures built on them, and where each lives (`schema.table.field`) |
 | **Unresolved** | issue | columns nobody could trace, measures without an answer, answers naming fields the model doesn't have, AI-named sources not found in the model's queries |
 
-## What the extractor traces without the AI
+## What the extractor does without the AI
 
 It traces a column when every Power Query step between the model and the source is one whose effect
 on column names is certain:
@@ -50,3 +56,12 @@ on column names is certain:
 
 It hands everything else to the AI: columns computed with `Table.AddColumn`, native SQL, expanded
 and joined columns, custom functions, and calculated tables.
+
+It classifies a measure itself when its shape leaves no judgment to make, by the same rules the AI
+follows:
+- **Aggregations:** `SUM(T[C])` and the other one-column aggregations, `COUNTROWS(T)`, `SELECTEDVALUE(T[C])`.
+- **Filters:** `CALCULATE` and `TOTALYTD` with constant filters, `ALL` / `REMOVEFILTERS` / `KEEPFILTERS`, `USERELATIONSHIP`, and time intelligence on a date column.
+- **Combinations:** arithmetic, `DIVIDE`, `FORMAT`, variables, and `IF` / `SWITCH` that test measures or `ISFILTERED`.
+
+FHSQLMonitor has 722 measures, and the extractor classifies 393 of them. The earlier AI run agreed
+on every one of those except 7, which were answered before the format-string rule was settled.

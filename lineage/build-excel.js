@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-// Step 3 of the measure lineage: merge what the extractor traced (model.json) with the AI's answers
-// (answers/*.json) and write <Model>-lineage.xlsx with three sheets:
+// Step 3 of the measure lineage: merge what the extractor traced and classified (model.json) with the
+// AI's answers (answers/*.json, earlier extractions' included for what hasn't changed since) and write
+// <Model>-lineage.xlsx with three sheets:
 //   Lineage          one row per measure × field × physical source
 //   By source field  measures grouped by the main source field and the helper fields they use
 //   Unresolved       what couldn't be traced, answers missing or not matching the model, checks
@@ -16,17 +17,33 @@ function buildLineage(dir) {
   const issues = [];   // [item, kind, reason, where]
   const answersDir = path.join(dir, 'answers');
   const columnAnswers = new Map(), measureAnswers = new Map();
-  // Each task carries a fingerprint of its content; an answer counts only for the task version it answered.
+  // Each task carries a fingerprint of its content; an answer counts only for the task version it
+  // answered. An earlier extraction's answer still counts for the items the extractor didn't ask
+  // again because their input is unchanged (model.json's reuse).
   const taskRuns = new Map((facts.tasks || []).map(t => [t.file, t.run]));
-  for (const f of (fs.existsSync(answersDir) ? fs.readdirSync(answersDir) : []).filter(f => f.endsWith('.json')).sort()) {
+  const reuse = facts.reuse || { measures: {}, columns: {} };
+  const reused = new Set([...Object.values(reuse.measures), ...Object.values(reuse.columns)]);
+  const files = (fs.existsSync(answersDir) ? fs.readdirSync(answersDir) : []).filter(f => /^(columns|measures)-\d+\.json$/.test(f)).sort();
+  for (const f of files) {
     let a;
     try { a = JSON.parse(fs.readFileSync(path.join(answersDir, f), 'utf8')); }
     catch (e) { issues.push([f, 'answer file', `not valid JSON: ${e.message}`, `answers/${f}`]); continue; }
-    if (!taskRuns.has(f)) { issues.push([f, 'answer file', 'answers a task this extraction doesn\'t have — ignored', `answers/${f}`]); continue; }
-    if (a.run !== taskRuns.get(f)) { issues.push([f, 'answer file', 'answers an earlier version of its task (the run differs) — ignored', `answers/${f}`]); continue; }
-    for (const c of (a.columns || [])) columnAnswers.set(c.column, { ...c, file: f });
-    for (const m of (a.measures || [])) measureAnswers.set(m.measure, { ...m, file: f });
+    let take = () => true;
+    if (taskRuns.has(f)) {
+      if (a.run !== taskRuns.get(f)) { issues.push([f, 'answer file', 'answers an earlier version of its task (the run differs) — ignored', `answers/${f}`]); continue; }
+    } else if (reused.has(f)) {
+      take = (kind, name) => reuse[kind][name] === f;
+    } else {
+      // Answered an earlier extraction whose items were all asked again or dropped: nothing to say.
+      // Without that copy of its task, it never matched a task.
+      if (!fs.existsSync(path.join(answersDir, f.replace(/\.json$/, '.task.json')))) issues.push([f, 'answer file', 'answers a task this extraction doesn\'t have — ignored', `answers/${f}`]);
+      continue;
+    }
+    for (const c of (a.columns || [])) if (take('columns', c.column)) columnAnswers.set(c.column, { ...c, file: f });
+    for (const m of (a.measures || [])) if (take('measures', m.measure)) measureAnswers.set(m.measure, { ...m, file: f, by: 'AI' });
   }
+  // The measures the extractor classified itself.
+  for (const m of facts.measures) if (m.classified) measureAnswers.set(m.name, { measure: m.name, ...m.classified, by: 'extractor' });
 
   // Everything the queries say, for checking that an AI-named source appears in them.
   const evidence = [...Object.values(facts.tables).map(t => [t.query, t.dax, t.partition].join('\n')), ...Object.values(facts.queries)].join('\n').toLowerCase();
@@ -94,11 +111,13 @@ function buildLineage(dir) {
     if (seen.includes(name)) return [];
     const a = measureAnswers.get(name);
     if (!a) return [];
-    const out = (a.fields || []).map(f => ({ field: f.field, role: f.role === 'main' ? 'main' : 'helper', usage: f.usage || '', via: [] }));
+    // `by`: who classified the field — the extractor only if it classified every measure on the way.
+    const out = (a.fields || []).map(f => ({ field: f.field, role: f.role === 'main' ? 'main' : 'helper', usage: f.usage || '', via: [], by: a.by }));
     for (const r of (a.measures || [])) {
       for (const f of fieldsOf(r.measure, [...seen, name])) {
         const asCondition = r.as === 'condition';
-        out.push({ field: f.field, role: asCondition ? 'helper' : f.role, usage: asCondition ? `condition (through [${r.measure}])` : f.usage, via: [r.measure, ...f.via] });
+        out.push({ field: f.field, role: asCondition ? 'helper' : f.role, usage: asCondition ? `condition (through [${r.measure}])` : f.usage,
+          via: [r.measure, ...f.via], by: a.by === 'AI' || f.by === 'AI' ? 'AI' : 'extractor' });
       }
     }
     const seenKey = new Set();
@@ -110,7 +129,11 @@ function buildLineage(dir) {
   // Check the answers against the model.
   const known = new Set([...Object.keys(facts.columns), ...Object.keys(facts.tables)]);
   const measureNames = new Set(facts.measures.map(m => m.name));
-  for (const m of facts.measures) if (!measureAnswers.has(m.name)) issues.push([m.name, 'measure', 'no answer classifies this measure', `tasks/${m.task || 'measures-NN'}.json`]);
+  for (const m of facts.measures) {
+    if (measureAnswers.has(m.name)) continue;
+    const where = m.task ? `tasks/${m.task}.json` : reuse.measures[m.name] ? `answers/${reuse.measures[m.name]} (missing it — extract again)` : 'tasks/measures-NN.json';
+    issues.push([m.name, 'measure', 'no answer classifies this measure', where]);
+  }
   for (const [name, a] of measureAnswers) {
     if (!measureNames.has(name)) issues.push([name, 'measure', 'answered, but the model has no measure of that name', `answers/${a.file}`]);
     for (const f of (a.fields || [])) if (!known.has(f.field)) issues.push([`${name} → ${f.field}`, 'field', 'not a column or table the extractor found for the measures', `answers/${a.file}`]);
@@ -125,7 +148,7 @@ function buildLineage(dir) {
   const measures = [...facts.measures].sort((a, b) => a.table.localeCompare(b.table) || a.name.localeCompare(b.name));
   for (const m of measures) {
     const fields = fieldsOf(m.name);
-    if (!fields.length && measureAnswers.has(m.name)) lineage.push({ m, f: { field: '', role: 'none', usage: 'uses no column', via: [] }, s: {} });
+    if (!fields.length && measureAnswers.has(m.name)) lineage.push({ m, f: { field: '', role: 'none', usage: 'uses no column', via: [], by: measureAnswers.get(m.name).by }, s: {} });
     for (const f of fields) for (const s of sourcesOf(f.field)) lineage.push({ m, f, s });
   }
   lineage.sort((x, y) => x.m.table.localeCompare(y.m.table) || x.m.name.localeCompare(y.m.name)
@@ -165,7 +188,9 @@ function buildLineage(dir) {
   }
   const bySource = [...groups.values()].sort((a, b) => (a.main ? fq(a.main.s) || a.main.f.field : '~').localeCompare(b.main ? fq(b.main.s) || b.main.f.field : '~'));
 
-  return { facts, lineage, bySource, issues, label, fq, answered: { columns: columnAnswers.size, measures: measureAnswers.size } };
+  const byAI = [...measureAnswers.values()].filter(a => a.by === 'AI' && measureNames.has(a.measure)).length;
+  return { facts, lineage, bySource, issues, label, fq,
+    answered: { columns: columnAnswers.size, measures: byAI, classified: facts.measures.filter(m => m.classified).length } };
 }
 
 function sheets(b) {
@@ -182,10 +207,11 @@ function sheets(b) {
       { header: 'Role', width: 8 }, { header: 'How it\'s used', width: 22 }, { header: 'Model field', width: 32 },
       { header: 'Through', width: 28, wrap: true }, { header: 'Connector', width: 12 }, { header: 'Source system', width: 30 },
       { header: 'Source schema', width: 14 }, { header: 'Source table', width: 28 }, { header: 'Source column', width: 24 },
-      { header: 'Trace', width: 11 }, { header: 'Note', width: 50, wrap: true }, { header: 'Traced by', width: 10 }, { header: 'Check', width: 40, wrap: true }],
+      { header: 'Trace', width: 11 }, { header: 'Note', width: 50, wrap: true }, { header: 'Classified by', width: 12 }, { header: 'Traced by', width: 10 },
+      { header: 'Check', width: 40, wrap: true }],
       rows: lineage.map(({ m, f, s }) => [m.name, m.table, m.folder, f.role, f.usage, f.field,
         [...f.via.map(v => `[${v}]`), ...(s.through || [])].join(' → '), s.connector || '', s.system || '', s.schema || '', s.table || '',
-        s.unresolved ? '' : s.column, s.unresolved ? 'unresolved' : s.trace || '', s.unresolved ? s.unresolved : s.note || '', s.unresolved ? '' : s.by || '', s.check || '']) },
+        s.unresolved ? '' : s.column, s.unresolved ? 'unresolved' : s.trace || '', s.unresolved ? s.unresolved : s.note || '', f.by || '', s.unresolved ? '' : s.by || '', s.check || '']) },
     { name: 'By source field', columns: [
       { header: 'Source field', width: 26, wrap: true }, { header: 'Helper fields', width: 30, wrap: true }, { header: 'Measures', width: 40, wrap: true },
       { header: 'Source field location (schema.table.field)', width: 44, wrap: true }, { header: 'Helper fields location (schema.table.field)', width: 50, wrap: true }],
@@ -206,7 +232,7 @@ function main() {
   const file = path.join(dir, `${b.facts.model.replace(/[<>:"/\\|?*\x00-\x1f]+/g, '_')}-lineage.xlsx`);
   fs.writeFileSync(file, writeXlsx(sheets(b)));
   const unresolved = b.lineage.filter(r => r.s.unresolved).length;
-  console.log(`${b.facts.model}: ${b.facts.measures.length} measures; answers for ${b.answered.measures} measures and ${b.answered.columns} columns.`);
+  console.log(`${b.facts.model}: ${b.facts.measures.length} measures, ${b.answered.classified} classified by the extractor; AI answers for ${b.answered.measures} measures and ${b.answered.columns} columns.`);
   console.log(`  Lineage: ${b.lineage.length} rows (${unresolved} not traced) · By source field: ${b.bySource.length} rows · Unresolved: ${b.issues.length}`);
   for (const i of b.issues.slice(0, 15)) console.log(`  ! ${i[1]} ${i[0]}: ${i[2]}`);
   if (b.issues.length > 15) console.log(`  … ${b.issues.length - 15} more on the Unresolved sheet`);

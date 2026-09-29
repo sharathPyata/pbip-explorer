@@ -12,6 +12,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { loadApp, fileList } = require('../tests/harness');
+const { classify } = require('./dax');
 
 const APP_FUNCTIONS = ['App', 'processFiles', 'pickProject', 'parseMSteps', 'inlineMParameters', 'extractSqlFromM',
   'splitTopLevel', 'findTopLevelEq', 'stripIdQuotes', 'tableKind', 'tableSource', 'parseDaxReferences', 'daxModelIndex',
@@ -398,25 +399,84 @@ function buildFacts(app, files, folder) {
   // Blank DAX comments before looking for references: a line commented out uses nothing
   // (SamplePBIP's Value Normalized keeps an old version of itself in comments).
   const uncommented = dax => String(dax || '').replace(/"(?:[^"]|"")*"|\/\/[^\n]*|--[^\n]*|\/\*[\s\S]*?\*\//g, m => (m[0] === '"' ? m : m.replace(/[^\n]/g, ' ')));
+  // The model's names, case-insensitively (DAX's rule), in the model's own spelling.
+  const colByLower = new Map(), measureByLower = new Map();
+  for (const t of s.tables) {
+    for (const c of t.columns) colByLower.set(`${t.name.toLowerCase()}\u0000${c.name.toLowerCase()}`, `${t.name}[${c.name}]`);
+    for (const m of t.measures) measureByLower.set(m.name.toLowerCase(), m.name);
+  }
+  const lookup = {
+    column: (t, c) => colByLower.get(`${String(t).toLowerCase()}\u0000${String(c).toLowerCase()}`) || null,
+    table: t => (tableByLower.get(String(t).toLowerCase()) || {}).name || null,
+    measure: m => measureByLower.get(String(m).toLowerCase()) || null,
+  };
+  // Table[Column] written out in the DAX (outside strings and comments), as opposed to a bare [Name]
+  // the explorer matches to every column of that name — its safe side for the Unused tab, but for
+  // lineage those are only candidates (a SELECTCOLUMNS alias like FHSQLMonitor's [Timestamp] matched 21).
+  const qualified = dax => {
+    const code = uncommented(dax).replace(/"(?:[^"]|"")*"/g, '""');
+    const out = new Set();
+    for (const m of code.matchAll(/(?:'((?:[^']|'')+)'|([\p{L}_][\p{L}\p{N}_]*))\[((?:[^\]]|\]\])+)\]/gu)) {
+      const k = lookup.column(m[1] !== undefined ? m[1].replace(/''/g, "'") : m[2], m[3].replace(/\]\]/g, ']'));
+      if (k) out.add(k);
+    }
+    return out;
+  };
   const refsOf = (daxText, home) => {
     const dax = uncommented(daxText);
     const r = app.parseDaxReferences(dax, home, ix);
     const cols = [...r.columns].map(k => byKey.get(k)).filter(Boolean).map(e => `${e.table}[${e.name}]`);
     const meas = [...r.measures].map(k => byKey.get(k)).filter(Boolean).map(e => e.name);
     const tables = [...app.daxNamesUsed(dax)].map(n => tableByLower.get(n)).filter(Boolean).map(t => t.name);
-    return { columns: [...new Set(cols)].sort(), measures: [...new Set(meas)].sort(), tables: [...new Set(tables)].sort() };
+    const q = qualified(daxText);
+    const all = [...new Set(cols)].sort();
+    return { columns: all.filter(k => q.has(k)), unqualified: all.filter(k => !q.has(k)), measures: [...new Set(meas)].sort(), tables: [...new Set(tables)].sort() };
+  };
+
+  // DAX user-defined functions (functions.tmdl): a measure that calls one uses what it reads.
+  const fnList = (s.functions || []).filter(f => f && f.name);
+  const callRe = name => new RegExp(`(?<![\\p{L}\\p{N}_.'\\]])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\(`, 'u');
+  const functions = {};
+  for (const f of fnList) {
+    const r = refsOf(f.dax, null);
+    functions[f.name] = { dax: f.dax || '', columns: [...r.columns, ...r.unqualified], measures: r.measures, tables: r.tables,
+      calls: fnList.filter(g => g !== f && callRe(g.name).test(uncommented(f.dax))).map(g => g.name) };
+  }
+  // A function that reads nothing from the model, nor do the ones it calls: FHSQLMonitor's colours.
+  const pure = new Map();
+  const isPure = (name, seen = []) => {
+    const f = functions[name];
+    if (!f || seen.includes(name)) return false;
+    if (!pure.has(name)) pure.set(name, !f.columns.length && !f.measures.length && !f.tables.length && f.calls.every(n => isPure(n, [...seen, name])));
+    return pure.get(name);
+  };
+  const fnByUpper = new Map(fnList.map(f => [f.name.toUpperCase(), f.name]));
+  lookup.pureFunction = fn => fnByUpper.has(String(fn).toUpperCase()) && isPure(fnByUpper.get(String(fn).toUpperCase()));
+  const calledBy = dax => {
+    const code = uncommented(dax), seen = new Set(), queue = fnList.filter(f => callRe(f.name).test(code)).map(f => f.name);
+    while (queue.length) { const n = queue.shift(); if (seen.has(n)) continue; seen.add(n); queue.push(...functions[n].calls); }
+    return [...seen].sort();
   };
 
   const measures = [];
   for (const t of s.tables) {
     for (const m of t.measures) {
-      measures.push({ name: m.name, table: t.name, folder: m.displayFolder || '', dax: m.dax || '', ...refsOf(m.dax, t.name) });
+      const r = refsOf(m.dax, t.name);
+      const entry = { name: m.name, table: t.name, folder: m.displayFolder || '', dax: m.dax || '', columns: r.columns, measures: r.measures, tables: r.tables };
+      if (r.unqualified.length) entry.unqualified = r.unqualified;
+      const fns = calledBy(m.dax);
+      if (fns.length) entry.functions = fns;
+      // A simple measure is classified here, by the rules the AI follows; the rest go to the AI.
+      const c = classify(m.dax, lookup);
+      if (c) entry.classified = c;
+      measures.push(entry);
     }
   }
 
-  // Columns the measures reach — directly, or through calculated columns — and the tables they name.
+  // Columns the measures reach — directly, through the functions they call, or through calculated
+  // columns — and the tables they name.
   const columns = {};
-  const queue = measures.flatMap(m => m.columns);
+  const queue = measures.flatMap(m => [...m.columns, ...(m.unqualified || []), ...(m.functions || []).flatMap(n => functions[n].columns)]);
   const tablesNamed = new Set(measures.flatMap(m => m.tables));
   while (queue.length) {
     const key = queue.shift();
@@ -428,9 +488,10 @@ function buildFacts(app, files, folder) {
     const entry = { table, column: name, sourceColumn: c.sourceColumn || '', tableKind: kind };
     if (c.calcDax) {
       const r = refsOf(c.calcDax, table);
-      Object.assign(entry, { calculated: c.calcDax, derivedFrom: r.columns });
-      entry.lineage = { derivedFrom: r.columns, trace: 'derived', note: 'calculated column', by: 'extractor' };
-      queue.push(...r.columns);
+      const from = [...r.columns, ...r.unqualified];   // a calculated column's bare [Col] is its own table's: certain
+      Object.assign(entry, { calculated: c.calcDax, derivedFrom: from });
+      entry.lineage = { derivedFrom: from, trace: 'derived', note: 'calculated column', by: 'extractor' };
+      queue.push(...from);
     } else {
       entry.lineage = traceColumn(ctx, t, c, entities);
     }
@@ -444,7 +505,8 @@ function buildFacts(app, files, folder) {
       const key = `${t.name}[${c.name}]`;
       if (columns[key]) continue;
       const entry = { table: t.name, column: c.name, sourceColumn: c.sourceColumn || '', tableKind: app.tableKind(t), used: false };
-      entry.lineage = c.calcDax ? { derivedFrom: refsOf(c.calcDax, t.name).columns, trace: 'derived', note: 'calculated column', by: 'extractor' }
+      const r = c.calcDax && refsOf(c.calcDax, t.name);
+      entry.lineage = c.calcDax ? { derivedFrom: [...r.columns, ...r.unqualified], trace: 'derived', note: 'calculated column', by: 'extractor' }
         : traceColumn(ctx, t, c, entities);
       if (c.calcDax) entry.calculated = c.calcDax;
       columns[key] = entry;
@@ -475,7 +537,7 @@ function buildFacts(app, files, folder) {
     explorer: `${path.basename(html)} sha1:${crypto.createHash('sha1').update(fs.readFileSync(html)).digest('hex').slice(0, 12)}`,
     parameters: app.modelParameters(s.expressions, s.tables).map(p => ({ name: p.name, type: p.type, value: p.value, loaded: p.loaded })),
     queries: Object.fromEntries([...ctx.queries.keys()].filter(n => n in (s.expressions || {})).map(n => [n, ctx.code(n)])),
-    tables, columns, measures,
+    functions, tables, columns, measures,
   };
 }
 
@@ -509,11 +571,69 @@ function traceColumn(ctx, t, c, entities) {
 
 /* ── Tasks for the AI ──────────────────────────────────────────────────────────────────────── */
 
+/* The exact input an answer to one item depends on — compared between extractions, so an item
+   whose input hasn't changed keeps its answer. `rules` is INSTRUCTIONS.md's rules version. */
+const measureInput = (rules, item, fnCode) =>
+  JSON.stringify({ rules, item, functions: Object.fromEntries((item.functions || []).map(n => [n, (fnCode || {})[n] || ''])) });
+const columnInput = (rules, table, column) => JSON.stringify({ rules, table, column });
+
+/* The rules version INSTRUCTIONS.md declares ("Rules version: 2"); bumped when a rule changes. */
+function rulesVersion() {
+  const text = fs.readFileSync(path.join(__dirname, 'INSTRUCTIONS.md'), 'utf8');
+  return (text.match(/Rules version:\s*(\d+)/) || [])[1] || '1';
+}
+
+/* Answers already given in `dir`: per measure and per column, every answer with the exact task input
+   it answered, oldest first. That input is answers/X.task.json, a copy of the task this function takes
+   while tasks/X.json still matches its answer (extract.js clears tasks/ next). Also the highest file
+   numbers used, so new task files never take an answered file's name. */
+function previousAnswers(dir) {
+  const out = { measures: new Map(), columns: new Map(), max: { columns: 0, measures: 0 } };
+  const add = (map, key, v) => (map.get(key) || map.set(key, []).get(key)).push(v);
+  const ad = path.join(dir, 'answers'), td = path.join(dir, 'tasks');
+  if (!fs.existsSync(ad)) return out;
+  const read = f => JSON.parse(fs.readFileSync(f, 'utf8'));
+  const files = fs.readdirSync(ad).map(f => f.match(/^(columns|measures)-(\d+)\.json$/)).filter(Boolean)
+    .sort((a, b) => a[1].localeCompare(b[1]) || a[2] - b[2]);
+  for (const [f, kind, n] of files) {
+    out.max[kind] = Math.max(out.max[kind], +n);
+    let ans, basis = null;
+    try { ans = read(path.join(ad, f)); } catch (e) { continue; }
+    const basisFile = path.join(ad, f.replace(/\.json$/, '.task.json'));
+    try { basis = read(basisFile); } catch (e) { basis = null; }
+    if (!basis || basis.run !== ans.run) {
+      try { const t = read(path.join(td, f)); if (t.run === ans.run) { basis = t; fs.writeFileSync(basisFile, JSON.stringify(t, null, 2)); } } catch (e) { /* no task file */ }
+    }
+    if (!basis || basis.run !== ans.run) continue;
+    const rules = basis.rules || '1';
+    if (kind === 'columns') {
+      for (const tb of (basis.tables || [])) {
+        const { columns: cols = [], ...table } = tb;
+        for (const c of cols) {
+          const item = (ans.columns || []).find(x => x.column === c.column);
+          if (item) add(out.columns, c.column, { input: columnInput(rules, table, c), file: f });
+        }
+      }
+    } else {
+      for (const m of (basis.measures || [])) {
+        const item = (ans.measures || []).find(x => x.measure === m.measure);
+        if (item) add(out.measures, m.measure, { input: measureInput(rules, m, basis.functions), file: f });
+      }
+    }
+  }
+  return out;
+}
+
 /* Split the work the extractor couldn't finish into files an AI can take one at a time:
    columns-NN.json (columns to trace, grouped by table with the evidence once per table) and
-   measures-NN.json (measures to classify). Each stays under `budget` characters. */
-function buildTasks(facts, { budget = 30000, perMeasureTask = 40 } = {}) {
+   measures-NN.json (measures to classify, with the code of any DAX function they call). Each stays
+   under `budget` characters. Measures the extractor classified, and items answered before whose
+   input is unchanged (`previous`), aren't asked again — `reuse` says where their answers are. */
+function buildTasks(facts, { budget = 30000, perMeasureTask = 40, rules = '1', previous = null, start = { columns: 0, measures: 0 } } = {}) {
   const tasks = [];
+  const reuse = { measures: {}, columns: {} };
+  // The latest earlier answer to exactly this input, if any.
+  const answered = (map, key, input) => (previous ? (map.get(key) || []).filter(h => h.input === input).pop() : null);
   const open = Object.entries(facts.columns).filter(([, c]) => c.used && c.lineage && c.lineage.unresolved);
   const byTable = new Map();
   for (const [key, c] of open) (byTable.get(c.table) || byTable.set(c.table, []).get(c.table)).push([key, c]);
@@ -545,35 +665,55 @@ function buildTasks(facts, { budget = 30000, perMeasureTask = 40 } = {}) {
   const flush = () => { if (current && current.tables.length) tasks.push(current); current = null; };
   for (const [table, cols] of byTable) {
     const ev = tableEvidence(table);
-    ev.columns = cols.map(([key, c]) => ({ column: key, sourceColumn: c.sourceColumn, stoppedAt: c.lineage.unresolved }));
-    const size = JSON.stringify(ev).length;
+    const entries = cols.map(([key, c]) => ({ column: key, sourceColumn: c.sourceColumn, stoppedAt: c.lineage.unresolved }))
+      .filter(c => {
+        const had = answered(previous && previous.columns, c.column, columnInput(rules, ev, c));
+        if (had) reuse.columns[c.column] = had.file;
+        return !had;
+      });
+    if (!entries.length) continue;
+    const size = JSON.stringify(ev).length + JSON.stringify(entries).length;
     if (!current || (current.size + size > budget && current.tables.length)) { flush(); current = { kind: 'columns', tables: [], size: 0 }; }
-    current.tables.push(ev);
+    current.tables.push({ ...ev, columns: entries });
     current.size += size;
   }
   flush();
   let batch = null;
+  const closeBatch = () => {
+    if (!batch) return;
+    const called = [...new Set(batch.measures.flatMap(m => m.functions || []))].sort();
+    if (called.length) batch.functions = Object.fromEntries(called.map(n => [n, facts.functions[n].dax]));
+    tasks.push(batch);
+    batch = null;
+  };
   for (const m of facts.measures) {
+    if (m.classified) continue;                                  // the extractor classified it
     const item = { measure: m.name, table: m.table, dax: m.dax, columns: m.columns, measures: m.measures, tables: m.tables };
-    const size = JSON.stringify(item).length;
+    if (m.unqualified) item.unqualified = m.unqualified;
+    if (m.functions) item.functions = m.functions;
+    const fnCode = Object.fromEntries((m.functions || []).map(n => [n, facts.functions[n].dax]));
+    const had = answered(previous && previous.measures, m.name, measureInput(rules, item, fnCode));
+    if (had) { reuse.measures[m.name] = had.file; continue; }
+    const size = JSON.stringify(item).length + JSON.stringify(fnCode).length;
     if (!batch || batch.measures.length >= perMeasureTask || (batch.size + size > budget && batch.measures.length)) {
-      if (batch) tasks.push(batch);
+      closeBatch();
       batch = { kind: 'measures', measures: [], size: 0 };
     }
     batch.measures.push(item);
     batch.size += size;
   }
-  if (batch) tasks.push(batch);
-  let nc = 0, nm = 0;
-  return tasks.map(t => {
+  closeBatch();
+  let nc = start.columns || 0, nm = start.measures || 0;
+  const out = tasks.map(t => {
     const file = t.kind === 'columns' ? `columns-${String(++nc).padStart(2, '0')}.json` : `measures-${String(++nm).padStart(2, '0')}.json`;
     const { size, ...rest } = t;
-    const body = { task: file.replace(/\.json$/, ''), model: facts.model, instructions: 'lineage/INSTRUCTIONS.md', ...rest };
-    // The task's fingerprint: an answer stays good for as long as the task it answers is unchanged,
-    // so extracting again leaves every answer whose measures or queries didn't change.
+    const body = { task: file.replace(/\.json$/, ''), model: facts.model, instructions: 'lineage/INSTRUCTIONS.md', rules, ...rest };
+    // The task's fingerprint, which its answer copies: the answer counts for this task version only.
     const run = crypto.createHash('sha1').update(JSON.stringify(body)).digest('hex').slice(0, 12);
     return { file, run, body: { ...body, run } };
   });
+  out.reuse = reuse;
+  return out;
 }
 
-module.exports = { readProjectFolder, loadModels, buildFacts, buildTasks, traceContext, traceQuery, describeRoot, mIf, mNavigation, mCall, namePairs, directLakeEntities };
+module.exports = { readProjectFolder, loadModels, buildFacts, buildTasks, previousAnswers, rulesVersion, traceContext, traceQuery, describeRoot, mIf, mNavigation, mCall, namePairs, directLakeEntities };

@@ -1,15 +1,17 @@
 // Measure lineage (lineage/): the extractor traces columns through the model's sourceColumn and Power
-// Query to their physical source where every step is certain, leaves the rest as AI tasks, and the
-// workbook build merges both — measures inheriting the fields of the measures they're built on,
-// calculated columns expanded to their sources. Shapes: FHSQLMonitor (Sql.Databases navigation with
-// a loaded parameter and an if … then … else), OD reviews (Oracle), SamplePBIP (CSV over a URL, a
-// generated calendar, Table.AddColumn), FCA (Direct Lake).
+// Query to their physical source where every step is certain, classifies the simple measures, leaves
+// the rest as AI tasks, and the workbook build merges both — measures inheriting the fields of the
+// measures they're built on, calculated columns expanded to their sources. Shapes: FHSQLMonitor
+// (Sql.Databases navigation with a loaded parameter and an if … then … else, a DAX function),
+// OD reviews (Oracle), SamplePBIP (CSV over a URL, a generated calendar, Table.AddColumn), FCA (Direct Lake).
 'use strict';
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { eq, has, suite } = require('./harness');
 const { loadModels, buildFacts, buildTasks } = require('../lineage/model');
+const { classify } = require('../lineage/dax');
+const { writeModel } = require('../lineage/extract');
 const { buildLineage } = require('../lineage/build-excel');
 const { writeXlsx, colLetter } = require('../lineage/xlsx');
 const { tests, test } = suite();
@@ -44,7 +46,9 @@ const files = {
       measure('Margin Total', 'SUM(Sales[Margin])'), measure('Orders Qty', 'SUM(Orders[Quantity])'), measure('Order Count', 'COUNTROWS(Orders)'),
       measure('Lake Total', "SUM('Lakehouse Sales'[Amount])"), measure('Month Label', "SELECTEDVALUE('Date'[Month])"),
       measure('Category Count', 'DISTINCTCOUNT(Products[Category])'), measure('Days', 'COUNTROWS(Calendar)'), measure('First Day', 'MIN(Calendar[Date])'),
-      measure('Server Label', "SELECTEDVALUE('Server name'[Server name])")]),
+      measure('Server Label', "SELECTEDVALUE('Server name'[Server name])"), measure('Big Orders', 'SUMX(FILTER(Orders, [Quantity] > 10), [Quantity])'),
+      measure('Latest', 'LatestDate()'), measure('Top Store Sales', 'MAXX(VALUES(Store[Region]), [Total Sales])')]),
+  'P.SemanticModel/definition/functions.tmdl': "function LatestDate = () => MAX('Date'[Date])\n\tlineageTag: c\n",
   'P.SemanticModel/definition/tables/Store.tmdl': tbl('Store', [['Region', 'REGION_NAME']], mPartition('Store', ['let',
     '    Source = Oracle.Database("""ora01:1521/SVC""", [HierarchicalNavigation=true]),', '    RETAIL = Source{[Schema="RETAIL"]}[Data],',
     '    STORES = RETAIL{[Name="STORES"]}[Data]', 'in', '    STORES'])),
@@ -86,21 +90,76 @@ test('the extractor traces columns through the model, Power Query navigation, re
   eq(lineageOf(f, 'Sales[Margin]'), { unresolved: 'computed in Power Query (Table.AddColumn "Margin")' }, 'Table.AddColumn is for the AI');
   eq(lineageOf(f, 'Orders[Quantity]'), { unresolved: 'a native SQL query' }, 'native SQL is for the AI');
   eq(f.tables.Orders.lineage.unresolved, 'a native SQL query', 'COUNTROWS(Orders): the table itself');
+  eq(f.columns['Date[Date]'].used, true, 'a column read by a DAX function a measure calls');
+});
+
+test('the extractor classifies the simple measures itself, by the rules the AI follows', async () => {
+  const f = await facts();
+  const by = name => f.measures.find(m => m.name === name).classified || null;
+  eq(by('Total Sales'), { fields: [{ field: 'Sales[Sales Amount]', role: 'main', usage: 'SUM' }], measures: [] }, 'SUM');
+  eq(by('West Sales'), { fields: [{ field: 'Store[Region]', role: 'helper', usage: 'filter' }], measures: [{ measure: 'Total Sales', as: 'value' }] }, 'CALCULATE with a filter');
+  eq(by('Order Count').fields, [{ field: 'Orders', role: 'main', usage: 'COUNTROWS' }], 'COUNTROWS');
+  eq(by('Month Label').fields, [{ field: 'Date[Month]', role: 'main', usage: 'SELECTEDVALUE' }], 'SELECTEDVALUE');
+  eq(by('Big West'), { fields: [], measures: [{ measure: 'West Sales', as: 'condition' }, { measure: 'Total Sales', as: 'value' }] }, 'IF over a measure');
+  eq(['Net Total', 'Big Orders', 'Latest', 'Top Store Sales'].map(by), [null, null, null, null], 'iterators, a function reading the model: for the AI');
+
+  // The shapes, against a small model (names in the model's spelling, whatever the DAX's case).
+  const cols = ['Sales[Amount]', 'Sales[Region]', 'Sales[Channel]', 'Sales[ShipDate]', 'Date[Date]'];
+  const model = {
+    column: (t, c) => cols.find(k => k.toLowerCase() === `${t}[${c}]`.toLowerCase()) || null,
+    table: t => ['Sales', 'Date'].find(n => n.toLowerCase() === String(t).toLowerCase()) || null,
+    measure: m => ['Total Sales', 'Fmt'].find(n => n.toLowerCase() === String(m).toLowerCase()) || null,
+    pureFunction: f => f.toUpperCase() === '_COLOR',
+  };
+  const h = (field, usage) => ({ field, role: 'helper', usage }), mn = (field, usage) => ({ field, role: 'main', usage });
+  const cases = [
+    ["sum ( 'sales'[amount] ) // SUM(Sales[Region])", [mn('Sales[Amount]', 'SUM')], []],
+    ['CALCULATE([Total Sales], Sales[Region] IN {"West", "East"}, KEEPFILTERS(Sales[Channel] = "Web"), ALL(\'Date\'))',
+      [h('Sales[Region]', 'filter'), h('Sales[Channel]', 'keeps filters'), h('Date', 'removes filters')], [{ measure: 'Total Sales', as: 'value' }]],
+    ["TOTALYTD(SUM(Sales[Amount]), 'Date'[Date])", [mn('Sales[Amount]', 'SUM'), h('Date[Date]', 'time intelligence')], []],
+    ["CALCULATE(SUM(Sales[Amount]), SAMEPERIODLASTYEAR('Date'[Date]), USERELATIONSHIP(Sales[ShipDate], 'Date'[Date]))",
+      [mn('Sales[Amount]', 'SUM'), h('Date[Date]', 'time intelligence, relationship'), h('Sales[ShipDate]', 'relationship')], []],
+    ['CALCULATE(COUNTROWS(Sales), ALLEXCEPT(Sales, Sales[Region]))', [mn('Sales', 'COUNTROWS'), h('Sales', 'removes filters'), h('Sales[Region]', 'keeps filters')], []],
+    ['DIVIDE([Total Sales], CALCULATE([Total Sales], REMOVEFILTERS()))', [], [{ measure: 'Total Sales', as: 'value' }]],
+    ['FORMAT([Total Sales], [Fmt])', [], [{ measure: 'Total Sales', as: 'value' }, { measure: 'Fmt', as: 'condition' }]],
+    ['SELECTEDVALUE(Sales[Region], "All") & " region"', [mn('Sales[Region]', 'SELECTEDVALUE')], []],
+    ['-42', [], []],
+    ['IF([Total Sales] > 0, [Total Sales], BLANK())', [], [{ measure: 'Total Sales', as: 'value' }]],   // tested and returned: a value
+    ['SWITCH(TRUE(), [Fmt] = 1, _color(), ISFILTERED(Sales[Region]), "#fff", BLANK())', [h('Sales[Region]', 'selection')], [{ measure: 'Fmt', as: 'condition' }]],
+    ['SWITCH([Fmt], 1, [Total Sales], 2, 0)', [], [{ measure: 'Fmt', as: 'condition' }, { measure: 'Total Sales', as: 'value' }]],
+    ['VAR _t = [Total Sales] VAR _txt = FORMAT(_t, [Fmt]) RETURN "Total: " & _txt', [], [{ measure: 'Total Sales', as: 'value' }, { measure: 'Fmt', as: 'condition' }]],
+  ];
+  for (const [dax, fields, measures] of cases) eq(classify(dax, model), { fields, measures }, dax);
+  for (const dax of ['SUMX(Sales, Sales[Amount])', 'IF(SUM(Sales[Amount]) > 0, 1)', 'IF(Sales[Region] = "West", 1)', 'SUM(Sales[Nope])', '[Qty]',
+    'CALCULATE([Total Sales], Sales[Region] = [Fmt])', 'CALCULATE([Total Sales], FILTER(Sales, Sales[Amount] > 0))', 'SUM(Sales[Amount]) ^ 2',
+    // A variable is evaluated where it's defined: inside CALCULATE's value it doesn't see the filters.
+    'VAR _t = [Total Sales] RETURN CALCULATE(_t, Sales[Region] = "West")', 'VAR _unused = [Fmt] RETURN [Total Sales]',
+    '_readsTheModel()', 'SWITCH([Fmt], [Total Sales], 1, 0)']) {
+    eq(classify(dax, model), null, dax);
+  }
 });
 
 test('what the extractor leaves becomes tasks: columns with their evidence, measures with their references', async () => {
   const f = await facts();
-  const tasks = buildTasks(f);
+  const tasks = buildTasks(f, { rules: '2' });
   eq(tasks.map(t => t.file), ['columns-01.json', 'measures-01.json'], 'task files');
   // A task's run is a fingerprint of its content: the same model gives the same runs.
-  eq(buildTasks(await facts()).map(t => t.run), tasks.map(t => t.run), 'runs are stable');
+  eq(buildTasks(await facts(), { rules: '2' }).map(t => t.run), tasks.map(t => t.run), 'runs are stable');
   if (tasks[0].run === tasks[1].run || !/^[0-9a-f]{12}$/.test(tasks[0].run)) throw new Error(`runs: ${tasks.map(t => t.run)}`);
+  eq(tasks[1].body.rules, '2', 'the rules version the task was made under');
   const cols = tasks[0].body.tables;
   eq(cols.map(t => [t.table, t.columns.map(c => c.column)]), [['Sales', ['Sales[Margin]']], ['Orders', ['Orders[Quantity]']]], 'columns to trace');
   has(cols[0].query, 'Sql.Database("sql01.contoso.com", "SalesDb")');   // the parameter's value filled in
   has(cols[1].query, 'SELECT o.id AS OrderId');
-  const west = tasks[1].body.measures.find(m => m.measure === 'West Sales');
-  eq([west.columns, west.measures], [['Store[Region]'], ['Total Sales']], 'a measure\'s references');
+  const ms = tasks[1].body.measures;
+  eq(ms.map(m => m.measure), ['Net Total', 'Big Orders', 'Latest', 'Top Store Sales'], 'only the measures the extractor couldn\'t classify');
+  eq(ms.find(m => m.measure === 'Top Store Sales').measures, ['Total Sales'], 'a measure\'s references');
+  // A bare [Quantity] could be any table's Quantity column: a candidate, apart from what the DAX writes out.
+  const big = ms.find(m => m.measure === 'Big Orders');
+  eq([big.columns, big.unqualified], [[], ['Orders[Quantity]']], 'bare [Name] references are candidates');
+  // A DAX function the measure calls: named on the measure, its code once per task.
+  eq(ms.find(m => m.measure === 'Latest').functions, ['LatestDate'], 'the functions a measure calls');
+  eq(tasks[1].body.functions, { LatestDate: "() => MAX('Date'[Date])" }, 'the functions\' code');
 });
 
 /* A model.json and answers in a temporary folder, as extract.js and the AI would leave them. */
@@ -126,7 +185,9 @@ const answers = {
     { measure: 'Orders Qty', fields: [main('Orders[Quantity]', 'SUM')], measures: [] },
     { measure: 'Order Count', fields: [main('Orders', 'COUNTROWS')], measures: [] },
     { measure: 'Lake Total', fields: [main('Lakehouse Sales[Amount]', 'SUM')], measures: [] },
-    { measure: 'Month Label', fields: [main('Date[Month]', 'SELECTEDVALUE'), main('Date[Nope]', 'SUM')], measures: [] },
+    { measure: 'Month Label', fields: [main('Date[Month]', 'SELECTEDVALUE'), main('Date[Nope]', 'SUM')], measures: [] },   // the extractor's classification wins
+    { measure: 'Big Orders', fields: [main('Orders[Quantity]', 'SUMX expression'), { field: 'Orders[Qty]', role: 'helper', usage: 'condition' }], measures: [] },
+    { measure: 'Top Store Sales', fields: [{ field: 'Store[Region]', role: 'helper', usage: 'iterates over' }], measures: [{ measure: 'Total Sales', as: 'value' }] },
     { measure: 'Category Count', fields: [main('Products[Category]', 'DISTINCTCOUNT')], measures: [] },
     { measure: 'First Day', fields: [main('Calendar[Date]', 'MIN')], measures: [] },
     { measure: 'Server Label', fields: [main('Server name[Server name]', 'SELECTEDVALUE')], measures: [] }] },
@@ -153,13 +214,54 @@ test('the workbook: grouped by source field; missing, unknown, stale and uncheck
   // of Margin Total (through the AI-traced Margin); West Sales and Big West add helpers.
   const groups = b.bySource.filter(g => g.main && b.fq(g.main.s) === 'dbo.FactSales.SalesAmt')
     .map(g => [g.helpers.map(h => b.fq(h.s)), g.measures]).sort((x, y) => x[0].length - y[0].length);
-  eq(groups, [[[], ['Margin Total', 'Net Total', 'Total Sales']], [['RETAIL.STORES.REGION_NAME'], ['West Sales']],
+  eq(groups, [[[], ['Margin Total', 'Net Total', 'Total Sales']], [['RETAIL.STORES.REGION_NAME'], ['Top Store Sales', 'West Sales']],
     [['dbo.FactSales.SalesAmt', 'RETAIL.STORES.REGION_NAME'], ['Big West']]], 'one row per main field and set of helpers');
   const issues = b.issues.map(i => `${i[1]}: ${i[0]}`);
-  for (const want of ['measure: Days', 'field: Month Label → Date[Nope]', 'answer file: measures-00.json', 'check: Sales[Margin]']) {
+  for (const want of ['measure: Latest', 'field: Big Orders → Orders[Qty]', 'answer file: measures-00.json', 'check: Sales[Margin]']) {
     if (!issues.includes(want)) throw new Error(`missing issue "${want}" in ${JSON.stringify(issues)}`);
   }
+  if (issues.some(i => /Date\[Nope\]/.test(i))) throw new Error(`an AI answer overrode the extractor's classification: ${JSON.stringify(issues)}`);
+  eq(b.lineage.filter(r => r.m.name === 'Month Label').map(r => [r.f.field, r.f.by]), [['Date[Month]', 'extractor']], 'classified by the extractor');
+  eq(b.lineage.filter(r => r.m.name === 'Top Store Sales').map(r => [r.f.field, r.f.by]),
+    [['Sales[Sales Amount]', 'AI'], ['Store[Region]', 'AI']], 'an AI answer, even through a measure the extractor classified');
   has(b.issues.find(i => i[1] === 'check')[2], 'source column "CostAmount" isn\'t in the model\'s queries');
+});
+
+test('extracting again asks only what changed; earlier answers still count for the rest', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lineage-'));
+  const read = f => JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'));
+  const answer = (file, body) => fs.writeFileSync(path.join(dir, 'answers', file), JSON.stringify({ task: file.replace(/\.json$/, ''), run: read(`tasks/${file}`).run, ...body }));
+  let tasks = writeModel(await facts(), dir, { rules: '2' });
+  eq(tasks.map(t => t.file), ['columns-01.json', 'measures-01.json'], 'the first extraction');
+  answer('columns-01.json', { columns: answers['columns-01.json'].columns });
+  const earlier = answers['measures-01.json'].measures;
+  answer('measures-01.json', { measures: [...['Net Total', 'Top Store Sales'].map(n => earlier.find(m => m.measure === n)),   // not Latest
+    { measure: 'Big Orders', fields: [main('Orders[Quantity]', 'SUMX expression'), { field: 'Orders[Quantity]', role: 'helper', usage: 'condition' }], measures: [] }] });
+
+  // Top Store Sales changes; nothing else does.
+  const changed = await facts();
+  changed.measures.find(m => m.name === 'Top Store Sales').dax = 'MAXX(VALUES(Store[Region]), [Margin Total])';
+  tasks = writeModel(changed, dir, { rules: '2' });
+  eq(tasks.map(t => [t.file, t.body.measures.map(m => m.measure)]), [['measures-02.json', ['Latest', 'Top Store Sales']]], 'the changed and the unanswered, numbered after the answered');
+  eq(fs.readdirSync(path.join(dir, 'tasks')).sort(), ['measures-02.json'], 'the old tasks are gone');
+  eq(read('answers/measures-01.task.json').run, read('answers/measures-01.json').run, 'a copy of the task each answer answered');
+  eq(read('model.json').reuse, { measures: { 'Net Total': 'measures-01.json', 'Big Orders': 'measures-01.json' },
+    columns: { 'Sales[Margin]': 'columns-01.json', 'Orders[Quantity]': 'columns-01.json' } }, 'where the kept answers are');
+
+  // The workbook takes the kept answers, and the new one for Top Store Sales rather than the kept file's.
+  answer('measures-02.json', { measures: [
+    { measure: 'Latest', fields: [main('Date[Date]', 'MAX')], measures: [] },
+    { measure: 'Top Store Sales', fields: [{ field: 'Store[Region]', role: 'helper', usage: 'iterates over' }], measures: [{ measure: 'Margin Total', as: 'value' }] }] });
+  const b = buildLineage(dir);
+  eq(b.issues.filter(i => i[1] !== 'check'), [], 'nothing missing or ignored');
+  eq([...new Set(b.lineage.filter(r => r.m.name === 'Top Store Sales' && r.f.role === 'main').map(r => r.f.field))], ['Sales[Margin]'], 'the new answer');
+  eq(b.lineage.filter(r => r.m.name === 'Net Total').map(r => r.s.column), ['Cost', 'SalesAmt'], 'a kept answer');
+
+  // Nothing changed: nothing to ask. A new rules version: everything the extractor didn't do, again.
+  eq(writeModel(changed, dir, { rules: '2' }).length, 0, 'nothing left for the AI');
+  tasks = writeModel(changed, dir, { rules: '3' });
+  eq(tasks.map(t => t.file), ['columns-02.json', 'measures-03.json'], 'a new rules version');
+  eq(tasks[1].body.measures.length, 4, 'every measure the extractor didn\'t classify');
 });
 
 /* The parts of a zip, read back through its central directory and inflated. */

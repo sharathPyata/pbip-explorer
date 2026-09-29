@@ -8,6 +8,9 @@ from its facts and your answers.
 Work only from what the task files contain. Never invent a table, column, server or schema name.
 When the evidence doesn't settle something, say so in the answer (see `trace` below) rather than guess.
 
+Rules version: 2. Each task records the version it was made under; when a rule below changes, the
+version goes up and the next extraction asks every item again.
+
 ## The three steps
 
 1. **Extract** (already run, or run it):
@@ -17,10 +20,15 @@ When the evidence doesn't settle something, say so in the answer (see `trace` be
    ```
 
    It writes `lineage-output/<project>/<Model>/`:
-   - `model.json`: the model's facts and every column source the script traced itself. Don't edit it.
+   - `model.json`: the model's facts, every column source the script traced itself and every measure
+     it classified itself. Don't edit it.
    - `tasks/columns-NN.json`: columns the script couldn't trace to their source.
-   - `tasks/measures-NN.json`: measures whose fields need classifying.
-   - `answers/`: empty, and where your answers go.
+   - `tasks/measures-NN.json`: measures the script couldn't classify. It does the simple ones itself,
+     by the rules below: one-column aggregations, `COUNTROWS`, `CALCULATE` with constant filters, and
+     `IF` / `SWITCH` that test measures.
+   - `answers/`: where your answers go. Answers from an earlier extraction stay there, and a measure or
+     column whose input hasn't changed isn't asked again. New tasks are numbered after the answered ones.
+     The `*.task.json` files there are the script's copies of the tasks those answers answered: leave them.
 
 2. **Answer every task file.** For each `tasks/<name>.json`, write `answers/<name>.json`, following
    the two sections below. The files are independent: do them in any order. With many of them, give
@@ -100,9 +108,11 @@ Each measure has:
 | Key | What it holds |
 |---|---|
 | `dax` | The measure's DAX. |
-| `columns` | The `Table[Column]` references the parser found. |
+| `columns` | The `Table[Column]` references the DAX writes out. |
+| `unqualified` | Columns matching a bare `[Name]` the DAX writes without a table. Only candidates: see the rules. |
 | `measures` | The other measures it uses. |
 | `tables` | The tables it names. |
+| `functions` | The DAX user-defined functions it calls, directly or through each other. Their code is in the task's top-level `functions`, by name. |
 
 The principle:
 - A **main** field is a column whose values make up the measure's result.
@@ -156,12 +166,15 @@ Helper fields:
 **Main or helper, when it's not obvious.** Judge by what the measure returns:
 - **An aggregate used only to decide something is a helper, not main.** That covers a count, MIN or MAX that's only tested, used as a filter bound, or used to pick a format or how many lines to print. Use usage `condition`, or `filter` for a bound. "Show filters Headers"-style measures, whose counts only decide line breaks, have no main field.
 - **Counting the rows that pass a test** (`COUNTX(FILTER(T, T[IsDamaged]), 1)`, `COUNTROWS(FILTER(T, …))`): the table is main (`COUNTX` or `COUNTROWS`), and the columns tested are helpers (`condition`).
-- **A main column the measure also checks** (`IF(ISBLANK(SUM(T[Amount])), …)`) doesn't get a second, helper entry. List it again only when it's filtered separately, as in `CALCULATE(SUM(T[Amount]), T[Amount] > 100)`.
+- **A main column the measure also checks** (`IF(ISBLANK(SUM(T[Amount])), …)`) doesn't get a second, helper entry. List it again only when it's filtered separately, as in `CALCULATE(SUM(T[Amount]), T[Amount] > 100)`, or tested for selection (`ISFILTERED(T[Amount])`: a helper, `selection`).
 
 Rules:
 - **A column used both ways** gets two entries, one per role.
 - **Tables as fields:** list a table as a field only for row counting (`COUNTROWS(T)`, `COUNTX(T, …)`: main) and for `ALL(T)` / `REMOVEFILTERS(T)` (helper, `removes filters`). A table an iterator merely runs over (`SUMX('Disk size', …)`, `FILTER('Date', …)`) isn't a field; the columns used inside are.
-- **A bare `[Name]` that isn't a model column**, such as a `SELECTCOLUMNS` / `ADDCOLUMNS` alias, is traced to the column it's defined from. Drop any task `columns` entry that the DAX only matches through such an alias.
+- **A bare `[Name]`** (the task's `unqualified`) is matched to every column of that name, so each is only a candidate:
+  - Keep the column the DAX reads: the one in the table the iterator or `FILTER` runs over (`[Qty]` inside `SUMX(Sales, …)` is `Sales[Qty]`). Drop the other candidates.
+  - When `[Name]` is an alias the DAX defines (`SELECTCOLUMNS`, `ADDCOLUMNS`, a table variable's column), list the column it's defined from, and none of the candidates.
+- **DAX functions** (the task's `functions`): what a called function reads counts as the measure's. Classify its columns and measures as if the function's body were written into the measure, with its parameters replaced by the arguments passed.
 - **A column used several ways within one role** gets one entry, with its usages comma-separated in the order they appear (`"time intelligence, iterates over"`).
 - **Commented-out DAX** (`//`, `--`, `/* … */`) uses nothing. Ignore any reference inside a comment.
 - **Other measures:** list every measure the DAX uses in `measures`, with `as` set to:
@@ -170,7 +183,7 @@ Rules:
 
   Don't copy another measure's fields into `fields` yourself; the build does that.
 - **Field names:**
-  - Take `field` values from the task's `columns` and `tables`.
+  - Take `field` values from the task's `columns`, `unqualified` and `tables`, and from the functions' code.
   - If the DAX uses a column the list missed, add it as `Table[Column]`, spelled exactly as the model names the table and column.
   - A column written without its table (`[Qty]` inside `SUMX(Sales, …)`) belongs to the table the iterator runs over.
 - **A measure that uses no column** (a constant, only other measures, or `REMOVEFILTERS()` with no argument) gets `"fields": []`.
