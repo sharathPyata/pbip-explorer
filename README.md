@@ -102,15 +102,15 @@ A report whose model isn't there — live-connected to a model in the Power BI s
 
 | Tab | What it shows |
 |---|---|
-| **Overview** | Big-number tiles, model metadata (PBI version, time-intelligence settings), table-kind breakdown, data-source summary |
+| **Overview** | Big-number tiles, model metadata (PBI version, time-intelligence settings), security roles (and the tables each filters), perspectives, DAX functions, table-kind breakdown, data-source summary |
 | **Sources** | Grouped data sources (Snowflake, SQL Server, Dataverse, SharePoint, Excel, OData, Web…). Multiple expressions hitting the same host collapse into one card, each listing its shared expressions and the tables that pull from it |
-| **Tables** | Master/detail browser. Left rail lists tables; right pane shows columns, measures grouped by display folder, calculation items, hierarchies, relationships, partition M code, inline data, extracted SQL, and annotations |
-| **Measures** | Flat searchable list of all DAX measures, grouped by table and display folder, with full DAX |
+| **Tables** | Master/detail browser. Left rail lists tables; right pane shows columns, measures grouped by display folder, calculation items, hierarchies, calendars, the security roles that filter the table (with their DAX) and the perspectives that include it, relationships, partition M code, inline data, extracted SQL, and annotations |
+| **Measures** | Flat searchable list of all DAX measures, grouped by table and display folder, with full DAX — then the model's DAX user-defined functions, with their descriptions |
 | **Relationships** | Force-directed graph. Pan, zoom, drag, hover-to-highlight; arrow markers; dashed lines for bidirectional cross-filter, dotted for inactive relationships |
 | **Pages** | Master/detail like Tables. "📑 All Pages" shows the stacked list of every page; selecting a specific page shows just that page's visuals. Hidden, drillthrough and tooltip pages are marked; each visual shows its title (or its textbox text, or an auto label from its fields), whether it's hidden — itself or through its group — and its group; hover for its ID. On a page with bookmarks, pick one to preview what it shows or hides. A search box at the top filters by field or measure name (e.g. `Sales.Amount`, `Profit`) and highlights matches inline |
 | **Unused** | Columns and measures with no references in visuals, filters, DAX, or M code. Toggle to also show "structural-only" items (referenced only by relationships / sortBy / hierarchies). For a report opened without its model it becomes **Fields used**: each model field the report needs, and what uses it (visuals, filters and bookmarks, report-level measures) |
 | **Notes** | Self-documenting reference describing exactly what the parser supports. Open even without loading a folder to read it |
-| **Export** | Generates a single Markdown document of the whole model — paste it into an AI chat as context, share it, or copy all measures at once. Section toggles + presets (Everything / Measures only / Schema only / AI prompt), with copy-to-clipboard and download-`.md` buttons. Report pages list page IDs, hidden / drillthrough / tooltip flags, and a row per visual and group with its ID, title, hidden state and group — the IDs bookmark files use. Each page with bookmarks also gets a matrix of what every bookmark shows or hides (shown / hidden / via group / — for untouched) |
+| **Export** | Generates a single Markdown document of the whole model — paste it into an AI chat as context, share it, or copy all measures at once. Section toggles + presets (Everything / Measures only / Schema only / AI prompt), with copy-to-clipboard and download-`.md` buttons. Security roles (each table filter's DAX), DAX functions and perspectives get sections of their own. Report pages list page IDs, hidden / drillthrough / tooltip flags, and a row per visual and group with its ID, title, hidden state and group — the IDs bookmark files use. Each page with bookmarks also gets a matrix of what every bookmark shows or hides (shown / hidden / via group / — for untouched) |
 
 ---
 
@@ -123,8 +123,8 @@ A report whose model isn't there — live-connected to a model in the Power BI s
 | **M (Power Query)** | Connector patterns, inline data (`Table.FromRecords`, `Table.FromRows`, base64+deflate-compressed inline data), generated tables such as Microsoft's `List.Dates` date table (shown as Computed, not inline data), SQL extracted from native queries, all M string escape sequences (`#(lf)`, `#(cr)`, `#(2605)`, etc.) |
 | **Report JSON** | Pages, visuals, field bindings (structured `Column` / `Measure` / `Hierarchy` / `HierarchyLevel` refs, and `queryRef` — a stale `queryRef`, left behind when a measure is renamed or moved, gives way to the field actually bound), visual positions and z-order, filter references, conditional formatting refs. Page visibility and kind (drillthrough / tooltip); visual IDs, hidden state, titles (constant or measure-driven), textbox text; visual groups and membership — in both the legacy and PBIR formats |
 | **Report extras** | `report.json` report-level filters, `reportExtensions.json` report-level measures (name, DAX, table), `bookmarks/*.bookmark.json` captured filter state and per-bookmark show/hide (visuals and groups, respecting "selected visuals" and "Display"); in legacy reports, bookmarks from `report.json`'s `config.bookmarks` and report-level measures from its `config.modelExtensions`. `definition.pbir`'s live connection: workspace, model and semantic model ID |
-| **Security & curation** | `roles/*.tmdl` RLS roles (`modelPermission`, `tablePermission` filter DAX), `perspectives/*.tmdl` membership |
-| **DAX functions** | `functions.tmdl` user-defined functions — the body's column/measure references count as usage |
+| **Security & curation** | `roles/*.tmdl` RLS roles (`modelPermission`, `tablePermission` filter DAX), `perspectives/*.tmdl` membership — both shown, and both count toward usage |
+| **DAX functions** | `functions.tmdl` user-defined functions and their `///` descriptions — listed in the Measures tab and the export; the body's column/measure references count as usage |
 | **Declared sources** | `dataSources.tmdl` explicit provider data sources, with host/database pulled from the connection string |
 
 ---
@@ -184,6 +184,7 @@ This means you can drop a PBIP that contains internal SQL, schema names, or sens
 - **`cultures/*.tmdl` (Q&A linguistic schema) is deliberately not counted as usage.** Power BI auto-generates a synonym entity for every table and every column, so treating the linguistic schema as a reference would mark the entire model "used" and render the Unused tab meaningless. This is an intentional exclusion, not a gap.
 - **Translations and cultures** are present in TMDL but not surfaced.
 - **GroupRef (binning) and RoleRef (RLS)** are not specifically handled.
+- **Object-level security** (a role's `metadataPermission` / `columnPermission`) isn't read, and a role's members aren't shown — only its model permission and row filters.
 
 ---
 

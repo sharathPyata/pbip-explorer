@@ -719,6 +719,7 @@ tr.row-unused td { opacity: 0.7; }
 tr.row-unused td:first-child { font-style: italic; }
 .measure-item.is-unused { opacity: 0.75; border-left-color: #c4d1c8; }
 .measure-item.is-structural { border-left-color: #b8c4be; }
+.measure-item.is-role { border-left-color: var(--pink); }
 
 .usage-toolbar {
   display: flex; gap: 10px; align-items: center;
@@ -1100,6 +1101,7 @@ tr.row-unused td:first-child { font-style: italic; }
 .dot.red { background: var(--red); }
 .dot.blue { background: var(--accent); }
 .dot.purple { background: var(--purple); }
+.dot.pink { background: var(--pink); }
 
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-track { background: var(--bg); }
@@ -1215,7 +1217,7 @@ const App = {
     modelFormat: '',      // 'TMDL' (definition/*.tmdl) or 'TMSL' (model.bim)
     roles: [],            // [{name, modelPermission, tablePermissions:[{table, dax}]}] from roles/*.tmdl
     perspectives: [],     // [{name, members:[{kind, table, name}]}] from perspectives/*.tmdl
-    functions: [],        // [{name, dax}] DAX user-defined functions from functions.tmdl
+    functions: [],        // [{name, dax, description}] DAX user-defined functions from functions.tmdl
     reportMeasures: [],   // report-level measures (PBIR reportExtensions.json, legacy config.modelExtensions)
     bookmarks: [],        // [{id, name, folder, page, display, data, targets, visuals, groups}] — see normaliseBookmark
     projectReports: [],   // names of the loaded report(s) — several when a shared model opens with all of them
@@ -1232,8 +1234,8 @@ const App = {
     searchTerm: '',
     showHidden: false,    // include hidden / LocalDateTable_* / DateTableTemplate* in displays?
     exportOpts: {         // which sections the Export (Markdown) tab includes
-      summary: true, sources: true, tables: true, measures: true, calcGroups: true,
-      relationships: true, pages: true, unused: true,
+      summary: true, sources: true, tables: true, measures: true, functions: true, calcGroups: true,
+      relationships: true, roles: true, perspectives: true, pages: true, unused: true,
       includeM: true, includeHidden: false, aiPreamble: false,
     },
   },
@@ -1337,6 +1339,24 @@ function measureExtraDax(m) {
     if (m.kpi.trend) out.push({ label: 'KPI trend', dax: m.kpi.trend });
   }
   if (m.detailRowsDax) out.push({ label: 'Detail rows', dax: m.detailRowsDax });
+  return out;
+}
+
+/* The security roles that filter a table — its row-level security — as [{ role, dax }]. */
+function roleFiltersOn(tableName) {
+  const want = String(tableName).toLowerCase(), out = [];
+  for (const role of (App.state.roles || [])) {
+    for (const tp of (role.tablePermissions || [])) if (tp.dax && String(tp.table).toLowerCase() === want) out.push({ role, dax: tp.dax });
+  }
+  return out;
+}
+/* Perspectives that expose a table's fields, with how many of them: [{ name, count }]. */
+function perspectivesWith(tableName) {
+  const want = String(tableName).toLowerCase(), out = [];
+  for (const p of (App.state.perspectives || [])) {
+    const count = (p.members || []).filter(m => String(m.table).toLowerCase() === want).length;
+    if (count) out.push({ name: p.name, count });
+  }
   return out;
 }
 
@@ -2048,7 +2068,7 @@ function parseTmslModel(bim) {
 
   const functions = [];
   for (const f of (model.functions || [])) {
-    if (f && f.name) functions.push({ name: f.name, dax: tmslText(f.expression).trim() });
+    if (f && f.name) functions.push({ name: f.name, dax: tmslText(f.expression).trim(), description: tmslText(f.description).trim() });
   }
 
   return {
@@ -3228,6 +3248,11 @@ function parseDataSources(text) {
 /* functions.tmdl — DAX user-defined functions. TMDL's root file for them; the default
    property is a DAX expression, so the body takes the same three shapes a measure's does.
    A column referenced only inside a UDF body would otherwise read as unused. */
+/* functions.tmdl — DAX user-defined functions: `function Name = <DAX>`, the DAX on that line, in a
+   ``` fence, or on the lines below it, two tabs in. The function's own properties (lineageTag:,
+   annotation …) are one tab in, so an indented body ends at the first line indented less than
+   two tabs; reading on to the next unindented line took them in too — the demo's AddTax came out
+   ending in its lineageTag. A /// block right above the declaration is its description. */
 function parseFunctions(text) {
   const out = [];
   if (!text) return out;
@@ -3237,6 +3262,8 @@ function parseFunctions(text) {
     if (!m) continue;
     const name = unquote(m[1]);
     const first = m[2];
+    const description = [];
+    for (let k = i - 1; k >= 0 && /^\/\/\//.test(lines[k]); k--) description.unshift(lines[k].replace(/^\/\/\/\s?/, ''));
     let dax = '';
     if (first.trim().startsWith('```')) {          // 1. backtick-fenced
       const parts = [];
@@ -3255,13 +3282,13 @@ function parseFunctions(text) {
       const parts = [];
       let k = i + 1;
       for (; k < lines.length; k++) {
-        if (lines[k].trim() && !/^\s/.test(lines[k])) break;   // next top-level declaration
+        if (lines[k].trim() && !/^\t\t/.test(lines[k])) break;   // a property, or the next declaration
         parts.push(lines[k]);
       }
       dax = normalizeIndent(parts.join('\n')).trim();
       i = k - 1;
     }
-    out.push({ name, dax });
+    out.push({ name, dax, description: description.join('\n').trim() });
   }
   return out;
 }
@@ -4335,6 +4362,16 @@ function renderOverview() {
   if (ann.PBIDesktopVersion) meta.push(`<span><strong>Power BI Desktop:</strong> ${esc(ann.PBIDesktopVersion)}</span>`);
   if (ann.__PBI_TimeIntelligenceEnabled) meta.push(`<span><strong>Time intelligence:</strong> ${annIsTrue(ann.__PBI_TimeIntelligenceEnabled) ? 'enabled' : 'disabled'}</span>`);
   if (ann.PBI_ProTooling) meta.push(`<span><strong>Tooling:</strong> <code>${esc(ann.PBI_ProTooling)}</code></span>`);
+  // Security roles (with the tables each filters), perspectives (with their size) and DAX functions.
+  const roles = App.state.roles || [], perspectives = App.state.perspectives || [], functions = App.state.functions || [];
+  const upTo = (names, n) => names.slice(0, n).join(', ') + (names.length > n ? `, and ${names.length - n} more` : '');
+  if (roles.length) meta.push(`<span><strong>Security roles (${roles.length}):</strong> ${roles.map(r => {
+    const tables = [...new Set((r.tablePermissions || []).filter(tp => tp.dax).map(tp => tp.table))];
+    return `${esc(r.name)}${tables.length ? ` <span style="color:var(--text-3)">(filters ${esc(tables.join(', '))})</span>` : ''}`;
+  }).join(', ')}</span>`);
+  if (perspectives.length) meta.push(`<span><strong>Perspectives (${perspectives.length}):</strong> ${perspectives.map(p =>
+    `${esc(p.name)} <span style="color:var(--text-3)">(${(p.members || []).length} field${(p.members || []).length === 1 ? '' : 's'})</span>`).join(', ')}</span>`);
+  if (functions.length) meta.push(`<span><strong>DAX functions (${functions.length}):</strong> ${esc(upTo(functions.map(f => f.name), 8))} — listed in the Measures tab</span>`);
 
   const sourcesHtml = sources.map(s => {
     const type = s.type;
@@ -4562,6 +4599,7 @@ function renderTableDetail() {
                 : (kind === 'auto-date' || kind === 'date-template') ? { type: 'other', name: 'Auto Date Tables' }
                 : detectSource(t.partitionSource, App.state.expressions, App.state.tables);
   const rels = App.state.relationships.filter(r => r.fromTable === t.name || r.toTable === t.name);
+  const rls = roleFiltersOn(t.name), persps = perspectivesWith(t.name);
   const measByFolder = {};
   for (const m of t.measures) {
     const f = m.displayFolder || '(no folder)';
@@ -4596,6 +4634,8 @@ function renderTableDetail() {
         <div class="detail-meta-item"><span class="dot purple"></span> ${t.measures.length} measures</div>
         ${t.hierarchies.length ? `<div class="detail-meta-item"><span class="dot yellow"></span> ${t.hierarchies.length} hierarch${t.hierarchies.length===1?'y':'ies'}</div>` : ''}
         ${t.calendars && t.calendars.length ? `<div class="detail-meta-item"><span class="dot yellow"></span> ${t.calendars.length} calendar${t.calendars.length===1?'':'s'}</div>` : ''}
+        ${rls.length ? `<div class="detail-meta-item"><span class="dot pink"></span> filtered by ${rls.length} security role${rls.length===1?'':'s'}</div>` : ''}
+        ${persps.length ? `<div class="detail-meta-item"><span class="dot green"></span> in perspective${persps.length===1?'':'s'} ${persps.map(p => esc(p.name)).join(', ')}</div>` : ''}
         ${t.calcItems && t.calcItems.length ? `<div class="detail-meta-item"><span class="dot purple"></span> ${t.calcItems.length} calc items</div>` : ''}
         ${t.calcGroupPrecedence != null ? `<div class="detail-meta-item"><span class="dot yellow"></span> precedence: <code>${esc(t.calcGroupPrecedence)}</code></div>` : ''}
         ${(kind === 'auto-date' || kind === 'date-template') && autoDateSourceFor(t.name) ? `<div class="detail-meta-item" style="background:var(--purple-light);padding:3px 8px;border-radius:4px"><span style="color:var(--purple);font-weight:600">Generated for</span> <span style="font-family:var(--mono)">${esc(autoDateSourceFor(t.name))}</span></div>` : ''}
@@ -4626,6 +4666,24 @@ function renderTableDetail() {
         </table>
       </div>
     </div>
+
+    ${rls.length ? `
+    <div class="subsection">
+      <div class="subsection-header open"><span class="arrow">▶</span>Row-level security <span class="pill">${rls.length}</span></div>
+      <div class="subsection-body">
+        <div style="color:var(--text-2);font-size:12px;margin-bottom:10px">Members of each role see only the rows where its filter is true.</div>
+        ${rls.map(({ role, dax }) => `
+          <div class="measure-item is-role">
+            <div class="measure-head">
+              <div class="measure-name">${esc(role.name)}</div>
+              ${role.modelPermission ? `<div class="measure-format">${esc(role.modelPermission)}</div>` : ''}
+            </div>
+            <pre class="measure-dax">${esc(dax)}</pre>
+          </div>
+        `).join('')}
+      </div>
+    </div>
+    ` : ''}
 
     ${t.calendars && t.calendars.length ? `
     <div class="subsection">
@@ -4873,6 +4931,10 @@ function renderMeasures() {
     m.table.toLowerCase().includes(filter) ||
     (m.displayFolder||'').toLowerCase().includes(filter)
   );
+  // The model's DAX functions (user-defined functions) come after the measures, under the same filter.
+  const allFns = App.state.functions || [];
+  const fns = allFns.filter(f => !filter || f.name.toLowerCase().includes(filter) ||
+    f.dax.toLowerCase().includes(filter) || (f.description || '').toLowerCase().includes(filter));
   // Group by table > displayFolder
   const groups = {};
   for (const m of filtered) {
@@ -4885,10 +4947,10 @@ function renderMeasures() {
   c.innerHTML = `
     ${reportOnly ? `<div style="color:var(--text-2);font-size:12px;margin-bottom:12px;line-height:1.55">Report-level measures: defined in this report, not its semantic model. ${modelWhereHtml()}, so the model's own measures aren't listed here.</div>` : ''}
     <div class="measures-toolbar">
-      <input type="text" id="measureSearchInput" placeholder="Filter measures by name, table, folder, or DAX content..." value="${esc(filter)}">
-      <span style="font-family:var(--mono);font-size:12px;color:var(--text-2)">${filtered.length} of ${all.length}</span>
+      <input type="text" id="measureSearchInput" placeholder="Filter measures${allFns.length ? ' and functions' : ''} by name, table, folder, or DAX content..." value="${esc(filter)}">
+      <span style="font-family:var(--mono);font-size:12px;color:var(--text-2)">${filtered.length} of ${all.length}${allFns.length ? ` · ${fns.length} of ${allFns.length} functions` : ''}</span>
     </div>
-    ${groupList.length === 0 ? '<div style="color:var(--text-3);font-style:italic;padding:20px 0">No measures match the filter.</div>' :
+    ${groupList.length === 0 ? (fns.length ? '' : '<div style="color:var(--text-3);font-style:italic;padding:20px 0">No measures match the filter.</div>') :
       groupList.map(g => `
         <div class="measure-group">
           <div class="measure-group-header">
@@ -4911,6 +4973,22 @@ function renderMeasures() {
         </div>
       `).join('')
     }
+    ${fns.length ? `
+      <div class="measure-group">
+        <div class="measure-group-header">
+          <span class="table-name">DAX functions</span>
+          <span class="folder-name">user-defined, callable from any DAX</span>
+          <span style="margin-left:auto;font-size:11px;color:var(--text-3);font-family:var(--mono)">${fns.length}</span>
+        </div>
+        ${fns.map(f => `
+          <div class="measure-item">
+            <div class="measure-head"><div class="measure-name">${highlight(f.name, filter)}</div></div>
+            ${f.description ? `<div style="color:var(--text-2);font-size:12px;margin-bottom:6px;white-space:pre-wrap">${highlight(f.description, filter)}</div>` : ''}
+            <pre class="measure-dax">${highlight(f.dax, filter)}</pre>
+          </div>
+        `).join('')}
+      </div>
+    ` : ''}
   `;
   const input = document.getElementById('measureSearchInput');
   if (input) {
@@ -5792,6 +5870,14 @@ function renderNotes() {
       <li>Shown in the Tables tab (category → columns, primary first) and the export. Usage: 9.1.</li>
     </ul>
 
+    <h3>3.6 Security roles, DAX functions, perspectives</h3>
+    <ul>
+      <li><strong>Roles</strong> — <code>roles/*.tmdl</code>: <code>role Name</code>, <code>modelPermission:</code>, and <code>tablePermission Table = &lt;DAX&gt;</code> row filters (single-line or indented below). Each table's detail lists the roles that filter it with their DAX; the Overview lists every role with the tables it filters; the export has a Security roles section.</li>
+      <li><strong>DAX functions</strong> — <code>functions.tmdl</code>: <code>function Name = &lt;DAX&gt;</code>, the DAX on that line, in a fence, or indented two tabs below it. The function's own properties (<code>lineageTag:</code>, annotations) are one tab in, so an indented body ends at the first line indented less — before, reading on to the next unindented line took them in, and the demo's <code>AddTax</code> ended in its lineageTag. A <code>///</code> block right above is the description. Listed after the measures in the Measures tab (the filter box covers them), named in the Overview, in the export and in the header search, which opens the Measures tab filtered to the function — showing it and the measures that call it.</li>
+      <li><strong>Perspectives</strong> — <code>perspectives/*.tmdl</code>: <code>perspectiveTable</code> with <code>perspectiveColumn</code> / <code>perspectiveMeasure</code> / <code>perspectiveHierarchy</code>. The Overview gives each one's size, a table's detail names the perspectives that include it, and the export lists each one's fields by table.</li>
+      <li>From <code>model.bim</code>: <code>roles[].tablePermissions[].filterExpression</code>, <code>functions[]</code> (with <code>description</code>) and <code>perspectives[].tables[]</code>, to the same shapes.</li>
+    </ul>
+
     <h2>4. Source detection — connector patterns</h2>
     <table>
       <thead><tr><th>Connector</th><th>M pattern matched</th><th>Type</th></tr></thead>
@@ -6052,7 +6138,7 @@ function renderNotes() {
     <h2>12. Export (Markdown) tab</h2>
     <p>Generates a single Markdown document describing the whole model + report, for pasting into an AI chat, sharing, or quick copy (e.g. grab every measure at once).</p>
     <ul>
-      <li><strong>Section toggles</strong> — Summary, Data sources, Tables &amp; columns, Measures (DAX), Calc groups, Relationships, Report pages, Unused</li>
+      <li><strong>Section toggles</strong> — Summary, Data sources, Tables &amp; columns, Measures (DAX), DAX functions, Calc groups, Relationships, Security roles, Perspectives, Report pages, Unused. <em>Measures only</em> takes the functions along; <em>Schema only</em> takes roles and perspectives.</li>
       <li><strong>Detail toggles</strong> — include M / Power Query code, include hidden tables, add an AI-prompt preamble line</li>
       <li><strong>Presets</strong> — <em>Everything</em>, <em>Measures only</em>, <em>Schema only</em>, <em>AI prompt</em> (preamble + everything)</li>
       <li><strong>Copy</strong> uses the async Clipboard API with a <code>document.execCommand('copy')</code> fallback for <code>file://</code>; <strong>Download</strong> writes a <code>&lt;projectName&gt;.md</code> via a Blob URL</li>
@@ -6065,9 +6151,8 @@ function renderNotes() {
     <ul>
       <li><strong>Function definitions in M</strong> (<code>let f = (x) => ...</code>) — not traced as a source. A table that calls a custom function won't be classified.</li>
       <li><strong>Parameters / variables</strong> as SQL — if the SQL is built at runtime via <code>"SELECT * FROM " &amp; TableNameParam</code>, only the literal pieces are extracted.</li>
-      <li><strong>RLS / row-level security roles</strong> — not surfaced.</li>
+      <li><strong>Object-level security</strong> (a role's <code>metadataPermission</code> / <code>columnPermission</code>) isn't read, and a role's members aren't shown — only its model permission and row filters.</li>
       <li><strong>Translations / cultures</strong> — present in TMDL but not displayed.</li>
-      <li><strong>Perspectives</strong> — used for usage analysis, not displayed.</li>
       <li><strong>A live connection is paired by name.</strong> A model folder with the name the connection gives is taken to be the connected model; the connection's workspace and semantic model ID can't be checked against a folder, so a same-named copy (say, a dev model) would be paired too. The Overview says when a report was paired this way.</li>
       <li><strong>Bookmarks</strong> — a cell is what applying the bookmark does, read from the file; "—" means it leaves the visual in whatever state it's in, which PBIP can't tell you (it depends on what was clicked before). Filter state a bookmark captures is used for field references but not shown. <strong>Themes</strong> aren't parsed.</li>
     </ul>
@@ -6118,6 +6203,18 @@ function runGlobalSearch() {
       if (hitInName || hitInDax) measHits.push({ t, m, hitInDax });
     }
   }
+  // DAX functions open the Measures tab filtered to the name (the function and what calls it);
+  // a security role opens the table it filters.
+  const fnHits = (App.state.functions || [])
+    .filter(f => f.name.toLowerCase().includes(term) || f.dax.toLowerCase().includes(term))
+    .map(f => ({ f, hitInDax: !f.name.toLowerCase().includes(term) }));
+  const roleHits = [];
+  for (const r of (App.state.roles || [])) {
+    if (!r.name.toLowerCase().includes(term)) continue;
+    const tp = (r.tablePermissions || []).find(x => x.dax);
+    const t = tp && App.state.tables.find(x => x.name.toLowerCase() === String(tp.table).toLowerCase());
+    if (t) roleHits.push({ r, table: t.name });
+  }
   const grp = (title, items, render) =>
     items.length === 0 ? '' :
     `<div class="search-result-group">
@@ -6147,6 +6244,20 @@ function runGlobalSearch() {
         <span class="search-result-name">${highlight(c.name, term)}</span>
         <span class="search-result-context">${esc(t.name)} · ${esc(c.dataType||'')}</span>
       </div>
+    `) +
+    grp('DAX functions', fnHits, ({f,hitInDax}) => `
+      <div class="search-result-item" data-action="function" data-name="${esc(f.name)}">
+        <span class="dot purple"></span>
+        <span class="search-result-name">${highlight(f.name, term)}</span>
+        <span class="search-result-context">function${hitInDax?' · in DAX':''}</span>
+      </div>
+    `) +
+    grp('Security roles', roleHits, ({r,table}) => `
+      <div class="search-result-item" data-action="table" data-name="${esc(table)}">
+        <span class="dot pink"></span>
+        <span class="search-result-name">${highlight(r.name, term)}</span>
+        <span class="search-result-context">filters ${esc(table)}</span>
+      </div>
     `);
 
   panel.innerHTML = html || '<div class="search-result-empty">No matches</div>';
@@ -6156,10 +6267,13 @@ function runGlobalSearch() {
       if (el.dataset.action === 'table') {
         App.state.activeTable = el.dataset.name;
         switchView('tables');
-        panel.classList.remove('visible');
-        App.els.globalSearch.value = '';
-        App.state.searchTerm = '';
-      }
+      } else if (el.dataset.action === 'function') {
+        App.state.measureFilter = el.dataset.name;
+        switchView('measures');
+      } else return;
+      panel.classList.remove('visible');
+      App.els.globalSearch.value = '';
+      App.state.searchTerm = '';
     };
   });
 }
@@ -6764,7 +6878,7 @@ function buildMarkdownExport(o) {
     push('> **Context for an AI assistant:** Below is a complete export of a Power BI semantic model'
        + ' (and its report) generated by PBIP Explorer. Use it as reference context when answering'
        + ' questions or proposing changes. It documents tables, columns, measures (DAX), relationships,'
-       + ' data sources, and report pages.');
+       + ' data sources, security roles, DAX functions, perspectives, and report pages.');
     push('');
   }
 
@@ -6798,6 +6912,9 @@ function buildMarkdownExport(o) {
     push(`| Relationships | ${s.relationships.length} |`);
     push(`| Data sources | ${sources.length} |`);
     push(`| Report pages | ${s.pages.length} (${s.pages.reduce((a, p) => a + p.visuals.length, 0)} visuals) |`);
+    if ((s.roles || []).length) push(`| Security roles | ${s.roles.length} |`);
+    if ((s.functions || []).length) push(`| DAX functions | ${s.functions.length} |`);
+    if ((s.perspectives || []).length) push(`| Perspectives | ${s.perspectives.length} |`);
     push('');
     const ann = s.modelAnnotations || {};
     const meta = [];
@@ -6902,6 +7019,16 @@ function buildMarkdownExport(o) {
     }
   }
 
+  // ── DAX functions (user-defined) ──
+  if (o.functions && (s.functions || []).length) {
+    push('## DAX functions', '', '_User-defined functions, callable from any DAX in the model._', '');
+    for (const f of s.functions) {
+      push(`### ${f.name}`, '');
+      if (f.description) push(f.description, '');
+      push('```dax', String(f.dax || '').trim(), '```', '');
+    }
+  }
+
   // ── Calculation groups ──
   if (o.calcGroups) {
     const groups = tables.filter(t => t.isCalcGroup && t.calcItems && t.calcItems.length);
@@ -6926,6 +7053,38 @@ function buildMarkdownExport(o) {
       push(`| ${mdCell(`${r.fromTable}[${r.fromColumn}]`)} | ${mdCell(`${r.toTable}[${r.toColumn}]`)} | ${xf} | ${r.isActive === false ? 'no' : 'yes'} |`);
     }
     push('');
+  }
+
+  // ── Security roles — row-level security: each role's filter on each table it guards ──
+  if (o.roles && (s.roles || []).length) {
+    push('## Security roles', '', '_Members of a role see only the rows where its filter on a table is true._', '');
+    for (const r of s.roles) {
+      push(`### ${r.name}`, '');
+      if (r.modelPermission) push(`- **Permission:** ${r.modelPermission}`, '');
+      const filters = (r.tablePermissions || []).filter(tp => tp.dax);
+      if (!filters.length) push('_No row filters._', '');
+      for (const tp of filters) push(`**Filters ${tp.table}:**`, '```dax', String(tp.dax).trim(), '```', '');
+    }
+  }
+
+  // ── Perspectives — the fields each one exposes, by table ──
+  if (o.perspectives && (s.perspectives || []).length) {
+    push('## Perspectives', '');
+    for (const p of s.perspectives) {
+      push(`### ${p.name}`, '');
+      const byTable = new Map();
+      for (const m of (p.members || [])) {
+        if (!byTable.has(m.table)) byTable.set(m.table, { column: [], measure: [], hierarchy: [] });
+        (byTable.get(m.table)[m.kind] || []).push(m.name);
+      }
+      if (!byTable.size) push('_No fields._');
+      for (const [table, k] of byTable) {
+        const parts = [['columns', k.column], ['measures', k.measure], ['hierarchies', k.hierarchy]]
+          .filter(([, names]) => names.length).map(([label, names]) => `${label}: ${names.join(', ')}`);
+        push(`- **${table}:** ${parts.join('; ')}`);
+      }
+      push('');
+    }
   }
 
   // ── Report pages ──
@@ -7050,7 +7209,8 @@ function buildMarkdownExport(o) {
 
 const EXPORT_SECTIONS = [
   ['summary', 'Summary'], ['sources', 'Data sources'], ['tables', 'Tables & columns'],
-  ['measures', 'Measures (DAX)'], ['calcGroups', 'Calc groups'], ['relationships', 'Relationships'],
+  ['measures', 'Measures (DAX)'], ['functions', 'DAX functions'], ['calcGroups', 'Calc groups'],
+  ['relationships', 'Relationships'], ['roles', 'Security roles'], ['perspectives', 'Perspectives'],
   ['pages', 'Report pages'], ['unused', 'Unused'],
 ];
 const EXPORT_DETAILS = [
@@ -7152,9 +7312,10 @@ function applyExportPreset(name) {
   if (name === 'everything') {
     setAll(true); o.includeM = true; o.includeHidden = false; o.aiPreamble = false;
   } else if (name === 'measures') {
-    setAll(false); o.measures = true; o.calcGroups = true; o.includeM = false; o.aiPreamble = false;
+    setAll(false); o.measures = true; o.functions = true; o.calcGroups = true; o.includeM = false; o.aiPreamble = false;
   } else if (name === 'schema') {
-    setAll(false); o.summary = true; o.tables = true; o.relationships = true; o.includeM = false; o.aiPreamble = false;
+    setAll(false); o.summary = true; o.tables = true; o.relationships = true; o.roles = true; o.perspectives = true;
+    o.includeM = false; o.aiPreamble = false;
   } else if (name === 'ai') {
     setAll(true); o.includeM = true; o.aiPreamble = true;
   }
