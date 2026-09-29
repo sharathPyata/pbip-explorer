@@ -97,8 +97,8 @@ Rules:
 - **A column of a calculated table (DAX):**
   - If its values come from model columns, put those in `derivedFrom` as `Table[Column]`, exactly as the model names them, and leave `sources` empty. The build traces them further.
   - If its values are typed into the DAX (`DATATABLE`, `{…}`, `GENERATESERIES`): `sources: [{ "connector": "typed-in", "system": "", "schema": "", "table": "<table> (values typed into DAX)", "column": "<column>" }]`, with `trace` set to `exact`.
-- **Values the query generates or types in** (a date list, Enter Data): connector `generated` or `typed-in`, with table `"<table> (rows generated in Power Query)"` or `"<table> (rows typed into the query)"`.
-- **A constant written into a query step** (`Table.AddColumn(t, "Flag", each "Yes")`): connector `typed-in`, with `trace` set to `exact`, like values typed into DAX. The value is what's typed.
+- **Values the query generates or types in** (a date list, Enter Data): connector `generated` or `typed-in`, with table `"<table> (rows generated in Power Query)"` or `"<table> (rows typed into the query)"`. A column computed from the generated values (a month name from the date list) names the generated column as its `column`, with `trace` set to `derived`.
+- **A constant written into a query step** (`Table.AddColumn(t, "Flag", each "Yes")`): connector `typed-in`, table `"<table> (value typed into the query)"`, with `trace` set to `exact`, like values typed into DAX. The value is what's typed.
 - **`note`:** always say briefly how you got there. The person reading the workbook checks it.
 
 ## measures-NN.json: classify each measure's fields
@@ -152,10 +152,10 @@ Helper fields:
 
 | Where the column appears | `usage` |
 |---|---|
-| Filter argument of `CALCULATE` / `CALCULATETABLE`, or `TREATAS` | `filter` |
+| Compared in a filter argument of `CALCULATE` / `CALCULATETABLE` (`=`, `IN`, `&&` / `||`, `CONTAINSSTRING`), or `TREATAS` | `filter` |
 | `KEEPFILTERS` | `keeps filters` |
 | `ALL`, `ALLEXCEPT`, `REMOVEFILTERS`, `ALLSELECTED`, `ALLNOBLANKROW` | `removes filters` |
-| Condition in `FILTER`, `IF`, `SWITCH`, `IFERROR`, `&&` / `||` tests | `condition` |
+| Tested in `FILTER` (even a `FILTER` that is a `CALCULATE` filter argument), `IF`, `SWITCH`, `IFERROR` | `condition` |
 | Date column of time intelligence: `DATESYTD`, `DATESMTD`, `TOTALYTD`, `SAMEPERIODLASTYEAR`, `DATEADD`, `PARALLELPERIOD`, `DATESBETWEEN`, `DATESINPERIOD`, and calendar-based time intelligence | `time intelligence` |
 | `USERELATIONSHIP`, `CROSSFILTER` | `relationship` |
 | `SELECTEDVALUE`, `VALUES`, `HASONEVALUE`, `ISFILTERED`, `ISINSCOPE` used to test or pick something | `selection` |
@@ -164,28 +164,31 @@ Helper fields:
 | The order-by argument of `CONCATENATEX`, `TOPN`, `RANKX`, `WINDOW` | `sort order` |
 
 **Main or helper, when it's not obvious.** Judge by what the measure returns:
-- **An aggregate used only to decide something is a helper, not main.** That covers a count, MIN or MAX that's only tested, used as a filter bound, or used to pick a format or how many lines to print. Use usage `condition`, or `filter` for a bound. "Show filters Headers"-style measures, whose counts only decide line breaks, have no main field.
-- **Counting the rows that pass a test** (`COUNTX(FILTER(T, T[IsDamaged]), 1)`, `COUNTROWS(FILTER(T, …))`): the table is main (`COUNTX` or `COUNTROWS`), and the columns tested are helpers (`condition`).
-- **A main column the measure also checks** (`IF(ISBLANK(SUM(T[Amount])), …)`) doesn't get a second, helper entry. List it again only when it's filtered separately, as in `CALCULATE(SUM(T[Amount]), T[Amount] > 100)`, or tested for selection (`ISFILTERED(T[Amount])`: a helper, `selection`).
+- **An aggregate used only to decide something is a helper, not main.** That covers a count, MIN or MAX that's only tested, used as a filter bound, or used to pick a format or how many lines to print. Use usage `condition`, `filter` for a bound, or both when it's both. A `SELECTEDVALUE` that only supplies a bound stays `selection`. "Show filters Headers"-style measures, whose counts only decide line breaks, have no main field.
+- **Counting the rows that pass a test** (`COUNTX(FILTER(T, T[IsDamaged]), 1)`, `COUNTROWS(FILTER(T, …))`, `COUNTX(T, IF(T[IsDamaged], 1))`): the table is main (`COUNTX` or `COUNTROWS`), and the columns tested are helpers (`condition`).
+- **Counting a column's values** (`COUNTROWS(VALUES(T[C]))`, `COUNTROWS(FILTER(VALUES(T[C]), …))`) counts that column, not the table: the column is the field. In "Show filters Headers"-style measures it's a helper, with `condition` and `iterates over` (and `selection` for an `ISFILTERED` test).
+- **A main column the measure also checks** (`IF(ISBLANK(SUM(T[Amount])), …)`) doesn't get a second, helper entry. List it again only when it's filtered separately, as in `CALCULATE(SUM(T[Amount]), T[Amount] > 100)`, tested for selection (`ISFILTERED(T[Amount])`: `selection`), iterated over or sorted by (`CONCATENATEX(VALUES(T[C]), T[C], ", ", T[C])`: `iterates over, sort order`).
 
 Rules:
 - **A column used both ways** gets two entries, one per role.
-- **Tables as fields:** list a table as a field only for row counting (`COUNTROWS(T)`, `COUNTX(T, …)`: main) and for `ALL(T)` / `REMOVEFILTERS(T)` (helper, `removes filters`). A table an iterator merely runs over (`SUMX('Disk size', …)`, `FILTER('Date', …)`) isn't a field; the columns used inside are.
+- **Tables as fields:** list a table as a field only for row counting (`COUNTROWS(T)`, `COUNTX(T, …)`: main) and for `ALL(T)` / `REMOVEFILTERS(T)` / `ALLSELECTED(T)` (helper, `removes filters`), wherever those appear: as a `CALCULATE` filter, or as the table an iterator runs over. A table an iterator merely runs over (`SUMX('Disk size', …)`, `FILTER('Date', …)`) isn't a field, and nor is `ISFILTERED(T)`; the columns used inside are.
 - **A bare `[Name]`** (the task's `unqualified`) is matched to every column of that name, so each is only a candidate:
   - Keep the column the DAX reads: the one in the table the iterator or `FILTER` runs over (`[Qty]` inside `SUMX(Sales, …)` is `Sales[Qty]`). Drop the other candidates.
   - When `[Name]` is an alias the DAX defines (`SELECTCOLUMNS`, `ADDCOLUMNS`, a table variable's column), list the column it's defined from, and none of the candidates.
 - **DAX functions** (the task's `functions`): what a called function reads counts as the measure's. Classify its columns and measures as if the function's body were written into the measure, with its parameters replaced by the arguments passed.
-- **A column used several ways within one role** gets one entry, with its usages comma-separated in the order they appear (`"time intelligence, iterates over"`).
+- **A column used several ways within one role** gets one entry, with its usages comma-separated (`"time intelligence, iterates over"`). Their order doesn't matter: the build puts them in a fixed order.
 - **Commented-out DAX** (`//`, `--`, `/* … */`) uses nothing. Ignore any reference inside a comment.
 - **Other measures:** list every measure the DAX uses in `measures`, with `as` set to:
-  - `value` when its result is part of this measure's result: arithmetic, `DIVIDE`, `CALCULATE([M], …)`, or returned by an `IF`/`SWITCH` branch. Its fields carry over with their roles.
+  - `value` when its result is part of this measure's result: arithmetic, text joined with `&`, `DIVIDE`, `CALCULATE([M], …)`, or returned by an `IF`/`SWITCH` branch. Its fields carry over with their roles.
   - `condition` when it's only tested (`IF([M] > 0, …)`, `FILTER(T, [M] > 5)`), only sets a filter value (`'X'[Date] = [Latest date]`), or only supplies a format (`FORMAT(x, [Date format string])`). Its fields carry over as helpers.
+
+  Wrapping it in `CALCULATE` doesn't change which: `CALCULATE([Latest date], REMOVEFILTERS(T))` used only as a filter value is a `condition`.
 
   Don't copy another measure's fields into `fields` yourself; the build does that.
 - **Field names:**
   - Take `field` values from the task's `columns`, `unqualified` and `tables`, and from the functions' code.
   - If the DAX uses a column the list missed, add it as `Table[Column]`, spelled exactly as the model names the table and column.
   - A column written without its table (`[Qty]` inside `SUMX(Sales, …)`) belongs to the table the iterator runs over.
-- **A measure that uses no column** (a constant, only other measures, or `REMOVEFILTERS()` with no argument) gets `"fields": []`.
+- **A measure that uses no column** (a constant, only other measures, or `REMOVEFILTERS()`, `ALL()` or `ALLSELECTED()` with no argument) gets `"fields": []`.
 - **Every measure in the task gets exactly one entry**, named exactly as in the task.
 - **`note`:** use it only for something a reader should know, such as a calculation group or field parameter changing what the measure does.

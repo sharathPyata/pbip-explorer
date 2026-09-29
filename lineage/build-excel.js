@@ -11,6 +11,15 @@ const fs = require('fs');
 const path = require('path');
 const { writeXlsx } = require('./xlsx');
 
+/* A field's usages in one order, whatever order the answer gave them: the helper usages as
+   INSTRUCTIONS.md's table lists them, then the rest (SUM, COUNTROWS, …) alphabetically. */
+const USAGE_ORDER = ['filter', 'keeps filters', 'removes filters', 'condition', 'time intelligence', 'relationship', 'selection', 'lookup', 'iterates over', 'sort order'];
+function usageOf(text) {
+  const rank = u => (USAGE_ORDER.includes(u) ? USAGE_ORDER.indexOf(u) : USAGE_ORDER.length);
+  return [...new Set(String(text || '').split(',').map(u => u.trim()).filter(Boolean))]
+    .sort((a, b) => rank(a) - rank(b) || a.localeCompare(b)).join(', ');
+}
+
 /* Everything the workbook needs, from the folder the extractor wrote and the AI filled in. */
 function buildLineage(dir) {
   const facts = JSON.parse(fs.readFileSync(path.join(dir, 'model.json'), 'utf8'));
@@ -112,7 +121,7 @@ function buildLineage(dir) {
     const a = measureAnswers.get(name);
     if (!a) return [];
     // `by`: who classified the field — the extractor only if it classified every measure on the way.
-    const out = (a.fields || []).map(f => ({ field: f.field, role: f.role === 'main' ? 'main' : 'helper', usage: f.usage || '', via: [], by: a.by }));
+    const out = (a.fields || []).map(f => ({ field: f.field, role: f.role === 'main' ? 'main' : 'helper', usage: usageOf(f.usage), via: [], by: a.by }));
     for (const r of (a.measures || [])) {
       for (const f of fieldsOf(r.measure, [...seen, name])) {
         const asCondition = r.as === 'condition';
@@ -240,4 +249,4 @@ function main() {
 }
 
 if (require.main === module) main();
-module.exports = { buildLineage, sheets };
+module.exports = { buildLineage, sheets, usageOf };

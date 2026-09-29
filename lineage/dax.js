@@ -277,7 +277,7 @@ function classify(dax, model) {
     const { fn, args } = n;
     if (fn === 'KEEPFILTERS' && args.length === 1) return filter(args[0], 'keeps filters');
     if (REMOVES.has(fn)) {
-      if (fn === 'REMOVEFILTERS' && !args.length) return true;   // clears every filter; names no column
+      if (!args.length) return fn !== 'ALLNOBLANKROW';          // REMOVEFILTERS(), ALL(), ALLSELECTED(): every filter; no column
       return args.length > 0 && args.every(a => { const x = colOf(a) || tableOf(a); if (!x) return false; field(x, 'helper', 'removes filters'); return true; });
     }
     if (fn === 'ALLEXCEPT' && args.length >= 2) {

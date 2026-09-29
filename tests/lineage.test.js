@@ -12,7 +12,7 @@ const { eq, has, suite } = require('./harness');
 const { loadModels, buildFacts, buildTasks } = require('../lineage/model');
 const { classify } = require('../lineage/dax');
 const { writeModel } = require('../lineage/extract');
-const { buildLineage } = require('../lineage/build-excel');
+const { buildLineage, usageOf } = require('../lineage/build-excel');
 const { writeXlsx, colLetter } = require('../lineage/xlsx');
 const { tests, test } = suite();
 
@@ -121,6 +121,7 @@ test('the extractor classifies the simple measures itself, by the rules the AI f
       [mn('Sales[Amount]', 'SUM'), h('Date[Date]', 'time intelligence, relationship'), h('Sales[ShipDate]', 'relationship')], []],
     ['CALCULATE(COUNTROWS(Sales), ALLEXCEPT(Sales, Sales[Region]))', [mn('Sales', 'COUNTROWS'), h('Sales', 'removes filters'), h('Sales[Region]', 'keeps filters')], []],
     ['DIVIDE([Total Sales], CALCULATE([Total Sales], REMOVEFILTERS()))', [], [{ measure: 'Total Sales', as: 'value' }]],
+    ['CALCULATE([Total Sales], ALL())', [], [{ measure: 'Total Sales', as: 'value' }]],
     ['FORMAT([Total Sales], [Fmt])', [], [{ measure: 'Total Sales', as: 'value' }, { measure: 'Fmt', as: 'condition' }]],
     ['SELECTEDVALUE(Sales[Region], "All") & " region"', [mn('Sales[Region]', 'SELECTEDVALUE')], []],
     ['-42', [], []],
@@ -222,6 +223,9 @@ test('the workbook: grouped by source field; missing, unknown, stale and uncheck
   }
   if (issues.some(i => /Date\[Nope\]/.test(i))) throw new Error(`an AI answer overrode the extractor's classification: ${JSON.stringify(issues)}`);
   eq(b.lineage.filter(r => r.m.name === 'Month Label').map(r => [r.f.field, r.f.by]), [['Date[Month]', 'extractor']], 'classified by the extractor');
+  // A field's usages read the same whatever order an answer gave them.
+  eq([usageOf('selection, condition, iterates over'), usageOf('iterates over, condition,selection'), usageOf('MIN, MAX, condition')],
+    ['condition, selection, iterates over', 'condition, selection, iterates over', 'condition, MAX, MIN'], 'usages in one order');
   eq(b.lineage.filter(r => r.m.name === 'Top Store Sales').map(r => [r.f.field, r.f.by]),
     [['Sales[Sales Amount]', 'AI'], ['Store[Region]', 'AI']], 'an AI answer, even through a measure the extractor classified');
   has(b.issues.find(i => i[1] === 'check')[2], 'source column "CostAmount" isn\'t in the model\'s queries');
