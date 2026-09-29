@@ -103,7 +103,7 @@ A report whose model isn't there — live-connected to a model in the Power BI s
 | Tab | What it shows |
 |---|---|
 | **Overview** | Big-number tiles, model metadata (PBI version, time-intelligence settings), security roles (and the tables each filters), perspectives, DAX functions, table-kind breakdown, data-source summary |
-| **Sources** | Grouped data sources (Snowflake, SQL Server, Dataverse, SharePoint, Excel, OData, Web…). Multiple expressions hitting the same host collapse into one card, each listing its shared expressions and the tables that pull from it |
+| **Sources** | Grouped data sources (Snowflake, SQL Server, Dataverse, SharePoint, Excel, OData, Web…). Multiple expressions hitting the same host collapse into one card, each listing its shared expressions and the tables that pull from it. Below the cards, the model's Power Query parameters: type, value and suggested values, description, and the tables that use each one — directly or through other queries |
 | **Tables** | Master/detail browser. Left rail lists tables; right pane shows columns, measures grouped by display folder, calculation items, hierarchies, calendars, the security roles that filter the table (with their DAX) and the perspectives that include it, relationships, partition M code, inline data, extracted SQL, and annotations |
 | **Measures** | Flat searchable list of all DAX measures, grouped by table and display folder, with full DAX — then the model's DAX user-defined functions, with their descriptions |
 | **Relationships** | Force-directed graph. Pan, zoom, drag, hover-to-highlight; arrow markers; dashed lines for bidirectional cross-filter, dotted for inactive relationships |

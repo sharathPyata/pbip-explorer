@@ -2646,6 +2646,67 @@ function isParameterQuery(sourceM) {
   return parameterLiteral(sourceM) !== null
     || /\bmeta\s*\[[^\]]*\bIsParameterQuery\s*=\s*true\b[^\]]*\]\s*$/.test(String(sourceM || ''));
 }
+/* A parameter's value and the fields of its meta record, both as M text:
+   `"DEV" meta [IsParameterQuery=true, List={"DEV", "QUAL"}, Type="Text"]` gives the value "DEV"
+   (quotes kept) and { IsParameterQuery: 'true', List: '{"DEV", "QUAL"}', Type: '"Text"' }. */
+function parameterParts(sourceM) {
+  const src = String(sourceM || '').trim();
+  let at = -1;
+  eachMToken(src, (i, c, depth) => { if (depth === 0 && c === 'm' && mKeywordAt(src, i, 'meta')) { at = i; return false; } });
+  const fields = {};
+  if (at < 0) return { value: src, fields };
+  for (const part of splitTopLevel(src.slice(at + 4).trim().replace(/^\[/, '').replace(/\]$/, ''), ',')) {
+    const eq = findTopLevelEq(part);
+    if (eq > 0) fields[part.slice(0, eq).trim()] = part.slice(eq + 1).trim();
+  }
+  return { value: src.slice(0, at).trim(), fields };
+}
+/* An M query prepared for mRefersTo: its code with strings and comments blanked, the same with
+   #"quoted identifiers" blanked as well, and the names its own let binds. */
+function mScan(mCode) {
+  const quoted = stripMNoise(mCode || '', true);
+  const steps = parseMSteps(mCode || '');
+  return {
+    quoted, bare: quoted.replace(/#"[^"]*"/g, q => '#"' + ' '.repeat(q.length - 3) + '"'),
+    shadowed: new Set(steps ? steps.steps.map(st => st.name) : []),
+  };
+}
+/* Whether a query (prepared by mScan) refers to `name`: as #"name", or bare when the name is a
+   plain identifier — not inside a string, a comment or another #"quoted identifier", not a
+   [field] access, and not when a step of the query's own let has that name (it shadows it). */
+function mRefersTo(scan, name) {
+  if (scan.shadowed.has(name)) return false;
+  if (scan.quoted.includes(`#"${name}"`)) return true;
+  return /^[A-Za-z_][A-Za-z0-9_.]*$/.test(name)
+    && new RegExp(`(?<![A-Za-z0-9_.\\[])${escRe(name)}(?![A-Za-z0-9_.])`).test(scan.bare);
+}
+/* The model's parameters for the Sources tab, in expressions.tmdl order: value, type and suggested
+   values (as M), /// description, the shared queries that name the parameter, and the Power Query
+   tables that use it — directly, or through any chain of queries that do. A table's query can be
+   referenced by the table's name, so tables are followed as well as shared queries. */
+function modelParameters(expressions, tables) {
+  const exprs = expressions || {};
+  const shared = new Set(Object.keys(exprs));
+  const mTables = (tables || []).filter(t => tableKind(t) === 'm');
+  const scans = new Map(Object.entries(exprs).map(([n, e]) => [n, mScan(e.sourceM)]));
+  for (const t of mTables) if (!scans.has(t.name)) scans.set(t.name, mScan(t.partitionSource));
+  const usersOf = new Map();
+  const users = x => {
+    if (!usersOf.has(x)) usersOf.set(x, [...scans].filter(([n, sc]) => n !== x && mRefersTo(sc, x)).map(([n]) => n));
+    return usersOf.get(x);
+  };
+  return Object.keys(exprs).filter(n => isParameterQuery(exprs[n].sourceM)).map(n => {
+    const reached = new Set([n]), queue = [n];
+    while (queue.length) for (const u of users(queue.shift())) if (!reached.has(u)) { reached.add(u); queue.push(u); }
+    const { value, fields } = parameterParts(exprs[n].sourceM);
+    return {
+      name: n, description: exprs[n].description || '', value,
+      type: fields.Type ? formatMValue(fields.Type) : '', list: fields.List || '',
+      queries: users(n).filter(q => shared.has(q) && !isParameterQuery(exprs[q].sourceM)),
+      tables: mTables.filter(t => reached.has(t.name)).map(t => t.name),
+    };
+  });
+}
 
 function inlineMParameters(mCode, expressions) {
   if (!mCode || !expressions) return mCode || '';
@@ -4454,12 +4515,56 @@ function visibleSources() {
     .filter(s => s.queries.length || (s.expressions && s.expressions.length));
 }
 
+/* The Sources tab's Parameters section, below the source cards: a parameter is an input to queries
+   rather than a source, so it has no card (isParameterQuery). Each row gives the type, the value
+   and any values it suggests, the /// description, and what uses it — table chips (hidden tables
+   counted while they're hidden) and the shared queries that name it. A parameter can reach most of
+   a model (FHSQLMonitor's Data load list feeds 113 tables), so past 12 chips the rest fold away. */
+function parametersHtml() {
+  const params = modelParameters(App.state.expressions, App.state.tables);
+  if (!params.length) return '';
+  const visible = new Set(visibleTables().map(t => t.name));
+  const chip = t => `<span class="chip" data-table="${esc(t)}">${esc(t)}</span>`;
+  const typeClass = { Text: 'string', Number: 'double', DateTime: 'dateTime', DateTimeZone: 'dateTime', Date: 'date' };
+  const shown = v => (v === 'null' ? '<span class="flag">null</span>'
+    : formatMValue(v) === '' ? '<span class="flag">empty</span>' : esc(formatMValue(v)));
+  const suggested = list => (list.startsWith('{')
+    ? `one of: ${splitTopLevel(list.slice(1, -1), ',').map(shown).join(', ')}`
+    : `values from the query ${esc(stripIdQuotes(list))}`);
+  return `
+    <div class="section-title">Parameters <span style="background:var(--bg-3);color:var(--text-2);padding:1px 6px;border-radius:8px;font-size:10px;letter-spacing:0;font-family:var(--mono)">${params.length}</span></div>
+    <div class="card" style="padding:0;overflow:auto">
+      <table class="columns-table">
+        <thead><tr><th>Parameter</th><th>Type</th><th>Value</th><th>Used by</th></tr></thead>
+        <tbody>${params.map(p => {
+          const shownTables = p.tables.filter(t => visible.has(t));
+          const hidden = p.tables.length - shownTables.length;
+          const used = [
+            ...shownTables.slice(0, 12).map(chip),
+            hidden ? `<span class="flag">+${hidden} hidden</span>` : '',
+            p.queries.length ? `<span class="flag">queries: ${esc(p.queries.join(', '))}</span>` : '',
+          ].filter(Boolean);
+          const more = shownTables.slice(12);
+          return `
+          <tr>
+            <td style="font-weight:600">${esc(p.name)}${p.description ? `<div style="font-family:var(--sans);font-weight:400;color:var(--text-2);margin-top:3px">${esc(p.description)}</div>` : ''}</td>
+            <td>${p.type ? `<span class="data-type ${typeClass[p.type] || ''}">${esc(p.type)}</span>` : ''}</td>
+            <td style="overflow-wrap:anywhere">${shown(p.value)}${p.list ? `<div class="flag" style="margin-top:3px">${suggested(p.list)}</div>` : ''}</td>
+            <td>
+              <div class="chip-row" style="align-items:center">${used.join('') || '<span class="flag">not used</span>'}</div>
+              ${more.length ? `<details style="margin-top:6px"><summary class="flag" style="cursor:pointer">and ${more.length} more table${more.length === 1 ? '' : 's'}</summary><div class="chip-row" style="margin-top:6px">${more.map(chip).join('')}</div></details>` : ''}
+            </td>
+          </tr>`;
+        }).join('')}</tbody>
+      </table>
+    </div>`;
+}
+
 function renderSources() {
   const c = App.els.sourcesContent;
   if (App.state.reportOnly) { c.innerHTML = modelMissingHtml('data sources'); return; }
   const sources = visibleSources();
-  if (!sources.length) { c.innerHTML = '<div class="card"><div class="card-body" style="color:var(--text-3)">No data sources to show</div></div>'; return; }
-  c.innerHTML = sources.map((s, idx) => `
+  c.innerHTML = (sources.map((s, idx) => `
     <div class="source-card" data-idx="${idx}">
       <div class="source-head">
         <div class="source-head-left">
@@ -4488,7 +4593,7 @@ function renderSources() {
         <div class="chip-row">${s.queries.map(q => `<span class="chip" data-table="${esc(q)}">${esc(q)}</span>`).join('') || '<span style="color:var(--text-3);font-size:12px">No tables use this source directly</span>'}</div>
       </div>
     </div>
-  `).join('');
+  `).join('') || '<div class="card"><div class="card-body" style="color:var(--text-3)">No data sources to show</div></div>') + parametersHtml();
   c.querySelectorAll('.source-head').forEach(h => {
     h.onclick = () => h.parentElement.classList.toggle('open');
   });
@@ -5931,6 +6036,13 @@ function renderNotes() {
       <li><strong>SQL / Snowflake / Oracle / SharePoint / Excel / API:</strong> group key is <code>type:host</code> (database/warehouse suffix dropped, lowercased).</li>
       <li><strong>Dataverse:</strong> group key is <code>dataverse:&lt;url&gt;</code> — different environments stay distinct.</li>
       <li><strong>Virtual sources</strong> (Calculated Tables, Calculation Groups, Auto Date Tables, Inline Data, Unknown) — kept as their own groups.</li>
+    </ul>
+
+    <h3>4.3 Parameters</h3>
+    <ul>
+      <li><strong>What counts:</strong> a shared expression whose value carries a <code>meta [IsParameterQuery=true, …]</code> record, whatever the type: text, number, date/time, logical or <code>null</code> (incremental refresh's <code>RangeStart</code> / <code>RangeEnd</code>). A bare string literal counts too. A parameter is an input to queries, not a source, so it gets no source card; text values are substituted into connector calls (<code>Sql.Database(Server, …)</code>) before detection.</li>
+      <li><strong>The list</strong> below the source cards gives each one's type, value (<code>#datetime(…)</code> shown as a date), the values it suggests (<code>List={…}</code>, or a query's name), its <code>///</code> description, and what uses it.</li>
+      <li><strong>Used by</strong> — a query uses a name it writes as <code>#"Name"</code>, or bare if the name is a plain identifier: not inside a string, a comment or another <code>#"…"</code>, not a <code>[Name]</code> field, and not when a step of the query's own <code>let</code> has that name. Uses are followed through shared queries and through tables' queries, which others can reference by the table's name. FHSQLMonitor's <code>Data load list</code> reaches 113 of its 128 Power Query tables that way (its <code>Data load</code> table reads it, and 111 tables read <code>#"Data load"</code>), so past 12 chips the rest fold away. Tables hidden from view are counted, not listed.</li>
     </ul>
 
     <h2>5. SQL extraction from M strings</h2>
