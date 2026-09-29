@@ -16,7 +16,7 @@ const model = (expressions, tables) => ({
   ...Object.fromEntries(tables.map(([name, m, extra], i) => [`P.SemanticModel/definition/tables/T${i}.tmdl`, table(name, m, extra)])),
 });
 async function load(files) {
-  const app = loadApp(['App', 'processFiles', 'renderSources', 'modelParameters'], { dom: true });
+  const app = loadApp(['App', 'processFiles', 'renderSources', 'modelParameters', 'buildMarkdownExport', 'applyExportPreset'], { dom: true });
   await app.processFiles(fileList(files));
   return app;
 }
@@ -77,6 +77,31 @@ test('the parameters: type, value and suggested values, description, and the tab
   s.showHidden = true;
   app.renderSources();
   has(app.App.els.sourcesContent.innerHTML, '<span class="chip" data-table="Staging">Staging</span>');
+});
+
+test('the export: a Parameters section after Data sources, its own toggle, and a count in the summary', async () => {
+  const app = await load(project);
+  const o = app.App.state.exportOpts;
+  const md = app.buildMarkdownExport(o);
+  has(md, '| Parameters | 6 |');
+  eq(md.slice(md.indexOf('## Parameters'), md.indexOf('## Tables')).split('\n'), [
+    '## Parameters', '', '_Power Query parameters: inputs to the queries rather than data sources._', '',
+    '### CSV_Location', '', 'Where the CSV files are', '',
+    '- **Type:** Text', '- **Value:** `https://raw.githubusercontent.com/pbi-tools/sales-sample/data/`',
+    '- **Tables (3):** Customer, Sales, Summary', '- **Queries (1):** RAW-Sales', '',
+    '### Environment', '', '- **Type:** Text', '- **Value:** `DEV`', '- **Suggested values:** DEV, QUAL, PRD', '- **Tables (2):** Sales, Summary', '',
+    '### RangeStart', '', '- **Type:** DateTime', '- **Value:** `2020-01-01`', '- **Tables (2):** Sales, Summary', '',
+    '### Randomizer', '', '- **Type:** Number', '- **Value:** `0.6`', '- **Tables (2):** Sales, Summary', '- **Queries (1):** RAW-Sales', '',
+    '### Data load list', '', '- **Type:** Text', '- **Value:** `null`', '- **Tables:** 1 hidden', '',
+    '### Remove Duplicate Resource IDs', '', '- **Type:** Logical', '- **Value:** `false`', '- **Suggested values:** false, true', '- **Used by:** none', '', '',
+  ], 'section');
+  if (!(md.indexOf('## Data sources') < md.indexOf('## Parameters'))) throw new Error('Parameters should follow Data sources');
+  has(app.buildMarkdownExport({ ...o, includeHidden: true }), '### Data load list\n\n- **Type:** Text\n- **Value:** `null`\n- **Tables (1):** Staging\n');
+  const off = app.buildMarkdownExport({ ...o, parameters: false });
+  hasNot(off, '## Parameters');
+  has(off, '| Parameters | 6 |');
+  const presets = ['schema', 'measures', 'everything'].map(name => { app.applyExportPreset(name); return o.parameters; });
+  eq(presets, [false, false, true], 'schema, measures, everything presets');
 });
 
 test("names, values and descriptions render as text; past 12 tables a parameter's chips fold away", async () => {
