@@ -2130,6 +2130,12 @@ function visibleTables() {
   return App.state.tables.filter(isVisibleTable);
 }
 
+/* expressions.tmdl — shared Power Query queries and parameters: `expression Name = <M>`, the M on
+   that line and on the lines below it, two tabs in. The expression's own properties (lineageTag:,
+   queryGroup:, annotation …) are one tab in, so the M ends at the first line indented less than
+   two tabs; reading on to the next unindented line took them in too, and the Sources tab and the
+   export showed FCA's DatabaseQuery ending in its lineageTag and annotation. A /// block right
+   above the declaration is its description. */
 function parseExpressions(text) {
   if (!text) return {};
   const result = {};
@@ -2149,15 +2155,12 @@ function parseExpressions(text) {
     const restFirst = m[2];
     i++;
     const mLines = restFirst.trim() ? [restFirst] : [];
-    while (i < lines.length) {
-      const ln = lines[i];
-      if (ln && !ln.startsWith('\t') && !ln.startsWith(' ')) {
-        if (ln.trimStart().startsWith('///')) break;
-        break;
-      }
-      mLines.push(ln);
+    while (i < lines.length && (!lines[i].trim() || /^\t\t/.test(lines[i]))) {
+      mLines.push(lines[i]);
       i++;
     }
+    // Then its properties, up to the next unindented line — a /// block or the next expression.
+    while (i < lines.length && /^(?:[\t ]|$)/.test(lines[i])) i++;
     result[ename] = {
       description: comments.join(' '),
       sourceM: mLines.join('\n').trimEnd(),
