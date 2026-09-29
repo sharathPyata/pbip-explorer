@@ -11,7 +11,7 @@ const path = require('path');
 const { eq, has, suite } = require('./harness');
 const { loadModels, buildFacts, buildTasks } = require('../lineage/model');
 const { classify } = require('../lineage/dax');
-const { writeModel } = require('../lineage/extract');
+const { writeModel, outputDir } = require('../lineage/extract');
 const { buildLineage, usageOf } = require('../lineage/build-excel');
 const { writeXlsx, colLetter } = require('../lineage/xlsx');
 const { tests, test } = suite();
@@ -266,6 +266,22 @@ test('extracting again asks only what changed; earlier answers still count for t
   tasks = writeModel(changed, dir, { rules: '3' });
   eq(tasks.map(t => t.file), ['columns-02.json', 'measures-03.json'], 'a new rules version');
   eq(tasks[1].body.measures.length, 4, 'every measure the extractor didn\'t classify');
+});
+
+test('two copies of one model in a folder get their own output folders', async () => {
+  // A Desktop holding P.SemanticModel and an older copy in Backup\ — both models are called P.
+  const desktop = {};
+  for (const [k, v] of Object.entries(files)) {
+    desktop[`Desktop/${k}`] = v;
+    desktop[`Desktop/Backup/${k}`] = k.endsWith('/tables/Sales.tmdl') ? `${v}\n${measure('Old Measure', '1')}` : v;
+  }
+  const apps = await loadModels(desktop);
+  eq(apps.map(a => a.modelRoot).sort(), ['Desktop/Backup/P.SemanticModel', 'Desktop/P.SemanticModel'], 'each model knows its folder');
+  const used = new Set();
+  const dirs = apps.map(a => { const f = buildFacts(a, desktop, 'Desktop'); return [f.measures.length, path.relative('out', outputDir('out', 'Desktop', f, used))]; });
+  eq(dirs.sort((x, y) => x[0] - y[0]), [[16, path.join('Desktop', 'P')], [17, path.join('Desktop', 'Backup', 'P')]], 'no copy overwrites the other');
+  // The usual case is unchanged: the project folder, then the model.
+  eq(path.relative('out', outputDir('out', 'P', await facts())), path.join('P', 'P'), 'one model');
 });
 
 /* The parts of a zip, read back through its central directory and inflated. */

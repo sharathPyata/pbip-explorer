@@ -40,18 +40,28 @@ function readProjectFolder(dir) {
   return files;
 }
 
-/* Load every semantic model in `files` with PBIP Explorer's parser; one fresh app per model. */
+/* Load every semantic model in `files` with PBIP Explorer's parser; one fresh app per model, each
+   knowing its folder (`modelRoot`, e.g. 'Desktop/Backup/Sales.SemanticModel'). */
 async function loadModels(files) {
   const first = loadApp(APP_FUNCTIONS, { dom: true });
   await first.processFiles(fileList(files));
   const pending = first.App.pendingProjects;
-  if (!pending) return first.App.state.tables.length || Object.keys(first.App.state.expressions).length ? [first] : [];
-  const apps = [];
+  if (!pending) {
+    if (!first.App.state.tables.length && !Object.keys(first.App.state.expressions).length) return [];
+    // The one model's folder, found as the explorer finds it.
+    const roots = [...new Set(Object.keys(files).map(k => (k.match(/^(.+)\/definition\/model\.tmdl$/) || k.match(/^(.+)\/model\.bim$/) || [])[1]).filter(Boolean))];
+    first.modelRoot = roots.length === 1 ? roots[0] : '';
+    return [first];
+  }
+  const apps = [], loaded = new Set();
   for (let i = 0; i < pending.projects.length; i++) {
-    if (!pending.projects[i].model) continue;
+    const model = pending.projects[i].model;
+    if (!model || loaded.has(model.root)) continue;    // a model with several reports is listed more than once
+    loaded.add(model.root);
     const app = loadApp(APP_FUNCTIONS, { dom: true });
     await app.processFiles(fileList(files));
     await app.pickProject(i);
+    app.modelRoot = model.root;
     apps.push(app);
   }
   return apps;
@@ -533,6 +543,7 @@ function buildFacts(app, files, folder) {
     model: s.projectName,
     modelFormat: s.modelFormat,
     folder: path.resolve(folder),
+    modelFolder: app.modelRoot || '',
     generated: new Date().toISOString(),
     explorer: `${path.basename(html)} sha1:${crypto.createHash('sha1').update(fs.readFileSync(html)).digest('hex').slice(0, 12)}`,
     parameters: app.modelParameters(s.expressions, s.tables).map(p => ({ name: p.name, type: p.type, value: p.value, loaded: p.loaded })),

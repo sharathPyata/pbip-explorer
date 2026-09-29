@@ -33,10 +33,11 @@ async function main() {
     process.exit(1);
   }
   const rules = rulesVersion();
+  if (apps.length > 1) console.log(`Found ${apps.length} semantic models under ${args.folder}; each gets its own output folder.`);
+  const used = new Set();
   for (const app of apps) {
     const facts = buildFacts(app, files, args.folder);
-    // <out>/<project folder>/<model>: many projects call their model Sales or Model.
-    const dir = path.join(args.out, safeName(path.basename(path.resolve(args.folder))), safeName(facts.model));
+    const dir = outputDir(args.out, args.folder, facts, used);
     const tasks = writeModel(facts, dir, { rules });
 
     const cols = Object.values(facts.columns).filter(c => c.used);
@@ -50,6 +51,7 @@ async function main() {
     const range = list => (list.length ? (list.length === 1 ? list[0].file : `${list[0].file} … ${list[list.length - 1].file}`) : 'none');
     const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
     console.log(`${facts.model} (${facts.modelFormat}): ${plural(facts.measures.length, 'measure')} use ${plural(cols.length, 'column')}.`);
+    if (apps.length > 1 && facts.modelFolder) console.log(`  Model folder: ${facts.modelFolder.split('/').join(path.sep)}`);
     console.log(`  Traced to their source: ${traced.length} (${Object.entries(byTrace).map(([k, v]) => `${k} ${v}`).join(', ') || 'none'})`);
     console.log(`  Measures classified here: ${classified}`);
     if (kept.measures || kept.columns) console.log(`  Answered before and unchanged: ${plural(kept.measures, 'measure')}, ${plural(kept.columns, 'column')} (kept)`);
@@ -58,6 +60,23 @@ async function main() {
     console.log(tasks.length ? `  Next: answer the tasks as lineage/INSTRUCTIONS.md describes, then run  node lineage/build-excel.js "${dir}"`
       : `  Nothing left for the AI. Next: node lineage/build-excel.js "${dir}"`);
   }
+}
+
+/* Where a model's output goes: <out>/<project folder>/<model>, since many projects call their model
+   Sales or Model. A model deeper in the folder keeps the folders in between, so two copies of one
+   model (Desktop/Sales.SemanticModel and Desktop/Backup/Sales.SemanticModel) never share a folder;
+   `used` holds the folders this run has already written. */
+function outputDir(out, input, facts, used = new Set()) {
+  const abs = path.resolve(input);
+  const top = fs.existsSync(abs) && fs.statSync(abs).isFile() ? path.dirname(abs) : abs;   // a .pbip file: its folder
+  const between = String(facts.modelFolder || '').split('/').slice(1, -1).map(safeName);
+  const base = path.join(out, safeName(path.basename(top)), ...between);
+  const folderName = String(facts.modelFolder || '').split('/').pop();
+  let dir = path.join(base, safeName(facts.model));
+  if (used.has(dir) && folderName) dir = path.join(base, safeName(folderName));   // Sales.Dataset beside Sales.SemanticModel
+  for (let n = 2; used.has(dir); n++) dir = path.join(base, `${safeName(facts.model)} (${n})`);
+  used.add(dir);
+  return dir;
 }
 
 /* Write one model's model.json and tasks/ into `dir`, keeping answers/ — whatever in it still answers
@@ -84,4 +103,4 @@ function writeModel(facts, dir, { rules }) {
 }
 
 if (require.main === module) main().catch(e => { console.error(e && e.stack || e); process.exit(1); });
-module.exports = { writeModel };
+module.exports = { writeModel, outputDir };

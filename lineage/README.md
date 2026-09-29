@@ -17,6 +17,11 @@ parser (`pbip-explorer.html`, unchanged). It needs Node and nothing to install.
    It writes `lineage-output/MyProject/<Model>/`, holding `model.json` and `tasks/*.json`: the
    columns it couldn't trace, and the measures it couldn't classify.
 
+   Point it at the folder holding the `.pbip` file, or at one model's `.SemanticModel` folder to
+   read only that model. A folder with several models, such as a Desktop, gets one output folder
+   per model. A copy of a model in a subfolder keeps that subfolder in its output path, so copies
+   don't overwrite each other.
+
 2. **Answer the tasks.** An AI answers each task file, following
    [INSTRUCTIONS.md](INSTRUCTIONS.md), into `answers/`. In VS Code with Claude Code, ask:
 
