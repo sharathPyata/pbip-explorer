@@ -3248,14 +3248,12 @@ function parseDataSources(text) {
   return out;
 }
 
-/* functions.tmdl — DAX user-defined functions. TMDL's root file for them; the default
-   property is a DAX expression, so the body takes the same three shapes a measure's does.
-   A column referenced only inside a UDF body would otherwise read as unused. */
 /* functions.tmdl — DAX user-defined functions: `function Name = <DAX>`, the DAX on that line, in a
    ``` fence, or on the lines below it, two tabs in. The function's own properties (lineageTag:,
    annotation …) are one tab in, so an indented body ends at the first line indented less than
    two tabs; reading on to the next unindented line took them in too — the demo's AddTax came out
-   ending in its lineageTag. A /// block right above the declaration is its description. */
+   ending in its lineageTag. A /// block right above the declaration is its description. A column
+   referenced only inside a UDF body would otherwise read as unused. */
 function parseFunctions(text) {
   const out = [];
   if (!text) return out;
