@@ -2483,6 +2483,11 @@ function extractAllReportReferences(report, structured) {
 function detectSource(mCode, expressions, tablesList, visited) {
   if (!mCode) return { key: 'unknown', name: 'Unknown', type: 'other', server: '' };
   visited = visited || new Set();
+  // Steps 1 and 4 look for the names of shared expressions and tables with mRefersTo, which
+  // skips strings, comments, [fields] and dotted names. Matching the raw M took RuiRomano's
+  // About table (rows typed into a #table) to its Sales table's source because one of its rows
+  // reads "Sales.pbip".
+  const scan = mScan(mCode);
 
   // 1. Shared expression reference → route to that expression's underlying source.
   //    A bare name only counts as a reference if this query's own `let` block doesn't
@@ -2491,14 +2496,10 @@ function detectSource(mCode, expressions, tablesList, visited) {
   //    `Source` by convention — without the shadow check, a shared expression called
   //    `Source` (or `Data`, `Date`, any other common step name) matches inside nearly
   //    every query in the model and claims all of them, silently beating the correct
-  //    direct-connector detection in step 3 below.
-  const localSteps = parseMSteps(mCode);
-  const shadowed = new Set(localSteps ? localSteps.steps.map(st => st.name) : []);
+  //    direct-connector detection in step 3 below. mRefersTo makes that check.
   let viaUnknown = null;
   for (const ename of Object.keys(expressions)) {
-    if (shadowed.has(ename)) continue;
-    const re = new RegExp(`#"${escRe(ename)}"|(?<![A-Za-z0-9_])${escRe(ename)}(?![A-Za-z0-9_])`);
-    if (re.test(mCode)) {
+    if (mRefersTo(scan, ename)) {
       const info = fromM(inlineMParameters(expressions[ename].sourceM, expressions));
       info.viaExpression = ename;
       // Only let the expression win if it actually resolved. A shared expression that
@@ -2524,8 +2525,7 @@ function detectSource(mCode, expressions, tablesList, visited) {
   if (tablesList && tablesList.length) {
     for (const t of tablesList) {
       if (visited.has(t.name) || !t.name) continue;
-      const re = new RegExp(`#"${escRe(t.name)}"|(?<![A-Za-z0-9_])${escRe(t.name)}(?![A-Za-z0-9_])`);
-      if (re.test(mCode)) {
+      if (mRefersTo(scan, t.name)) {
         const newVisited = new Set(visited); newVisited.add(t.name);
         const resolved = detectSource(t.partitionSource, expressions, tablesList, newVisited);
         if (resolved.key !== 'unknown') {
@@ -2672,13 +2672,14 @@ function mScan(mCode) {
   };
 }
 /* Whether a query (prepared by mScan) refers to `name`: as #"name", or bare when the name is a
-   plain identifier — not inside a string, a comment or another #"quoted identifier", not a
-   [field] access, and not when a step of the query's own let has that name (it shadows it). */
+   plain identifier (letters in any script, as M allows: `Source = Umsätze`) — not inside a string,
+   a comment or another #"quoted identifier", not a [field] access, not part of a dotted name
+   (Date.From isn't the table Date), and not when a step of the query's own let has that name. */
 function mRefersTo(scan, name) {
   if (scan.shadowed.has(name)) return false;
   if (scan.quoted.includes(`#"${name}"`)) return true;
-  return /^[A-Za-z_][A-Za-z0-9_.]*$/.test(name)
-    && new RegExp(`(?<![A-Za-z0-9_.\\[])${escRe(name)}(?![A-Za-z0-9_.])`).test(scan.bare);
+  return /^[\p{L}_][\p{L}\p{N}\p{M}\p{Pc}.]*$/u.test(name)
+    && new RegExp(`(?<![\\p{L}\\p{N}\\p{M}\\p{Pc}.\\[])${escRe(name)}(?![\\p{L}\\p{N}\\p{M}\\p{Pc}.])`, 'u').test(scan.bare);
 }
 /* The model's parameters for the Sources tab, in expressions.tmdl order: value, type and suggested
    values (as M), /// description, the shared queries that name the parameter, and the Power Query
@@ -6023,7 +6024,7 @@ function renderNotes() {
 
     <h3>4.1 Resolution order in <code>detectSource</code></h3>
     <ol>
-      <li><strong>Shared expression reference</strong> — if M contains <code>#"ExprName"</code> or a bareword expression name, route to the expression's underlying source (not to the expression itself).</li>
+      <li><strong>Shared expression reference</strong> — if M contains <code>#"ExprName"</code> or a bareword expression name, route to the expression's underlying source (not to the expression itself). A name counts as M reads it (<code>mRefersTo</code>, as in 4.3), here and in step 4: not inside a string or comment, another <code>#"…"</code>, a <code>[Name]</code> field or a dotted name (<code>Date.From</code> isn't the table <code>Date</code>), and not when one of the query's own steps has that name. Matching the raw text sent RuiRomano's About table (rows typed into a <code>#table</code>) to the Sales table's source over the text <code>"Sales.pbip"</code>, and FHSQLMonitor's <code>#"Database name"</code> to its <code>Database</code> table.</li>
       <li><strong>Inline data</strong> — <code>Table.FromRecords</code>, <code>Table.FromRows</code>, or <code>Table.FromList</code> over a list typed into the query → "Inline Data" virtual source. <code>Table.FromList</code> over a list the query generates (<code>List.Dates</code> …) is Computed instead, after any connector the query also names.</li>
       <li><strong>Direct connector</strong> — match against the patterns above.</li>
       <li><strong>Another table reference</strong> — if M references another model table (<code>Source = #"OtherTable"</code>), recursively resolve to that table's ultimate source. Cycle detection via <code>visited</code> set.</li>
@@ -6284,6 +6285,7 @@ function renderNotes() {
     <ul>
       <li><strong>Function definitions in M</strong> (<code>let f = (x) => ...</code>) — not traced as a source. A table that calls a custom function won't be classified.</li>
       <li><strong>Parameters / variables</strong> as SQL — if the SQL is built at runtime via <code>"SELECT * FROM " &amp; TableNameParam</code>, only the literal pieces are extracted.</li>
+      <li><strong>A parameter loaded as a table</strong> (a parameter with <em>Enable load</em> is a table whose query is the parameter) isn't substituted into connector calls, nor listed with the parameters. FHSQLMonitor's <code>Server name</code>, <code>Database name</code> and <code>Schema name</code> are such tables, so a query reading only <code>Sql.Databases(#"Server name")</code> shows as Unknown rather than SQL Server <code>localhost</code>.</li>
       <li><strong>Object-level security</strong> (a role's <code>metadataPermission</code> / <code>columnPermission</code>) isn't read, and a role's members aren't shown — only its model permission and row filters.</li>
       <li><strong>Translations / cultures</strong> — present in TMDL but not displayed.</li>
       <li><strong>A live connection is paired by name.</strong> A model folder with the name the connection gives is taken to be the connected model; the connection's workspace and semantic model ID can't be checked against a folder, so a same-named copy (say, a dev model) would be paired too. The Overview says when a report was paired this way.</li>

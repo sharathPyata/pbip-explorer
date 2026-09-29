@@ -180,4 +180,22 @@ test("Microsoft's List.Dates date table is Computed, not Inline Data", () => {
     '    T = Table.FromList(D, Splitter.SplitByNothing())', 'in', '    T']), 'sql-server', 'a generated list next to a connector');
 });
 
+test("a table or shared query named in a string, a comment, a [field] or a dotted name isn't where the data comes from", () => {
+  const { detectSource } = loadApp(['detectSource']);
+  const sql = ['let', '    Source = Sql.Database("sql.contoso.com", "SalesDb")', 'in', '    Source'].join('\n');
+  const tables = ['Sales', 'Date', 'Umsätze'].map(name => ({ name, partitionSource: sql }));
+  const expressions = { Staging: { sourceM: 'Sql.Database("staging.contoso.com", "Stage")' } };
+  const kind = m => { const r = detectSource(m.join('\n'), expressions, tables); return r.type === 'other' ? r.key : `${r.type} via ${r.viaTable || r.viaExpression}`; };
+  // RuiRomano's About table: rows typed into a #table, one of them naming the project file.
+  eq(kind(['let', '    Source = #table({"Key", "Value"}, {{"Description", "Sales.pbip"}, {"Loaded from", "Staging"}})', 'in', '    Source']), 'computed', 'strings');
+  eq(kind(['let', '    // was: Source = Sales', '    Source = #table({"Year"}, {{Date.Year(DateTime.LocalNow())}}),',
+    '    Added = Table.AddColumn(Source, "Total", each [Sales] + 1)', 'in', '    Added']), 'computed', 'a comment, Date.Year and a [field]');
+  eq(kind(['let', '    Source = #"Sales Archive"', 'in', '    Source']), 'unknown', 'another quoted name');
+  // Real references still count: bare, quoted, in another script, and a shared query.
+  eq(kind(['let', '    Source = Sales,', '    Kept = Table.SelectRows(Source, each [Amount] > 0)', 'in', '    Kept']), 'sql-server via Sales', 'bare');
+  eq(kind(['let', '    Source = #"Date"', 'in', '    Source']), 'sql-server via Date', 'quoted');
+  eq(kind(['let', '    Source = Umsätze', 'in', '    Source']), 'sql-server via Umsätze', 'a name in another script');
+  eq(kind(['let', '    Source = Staging', 'in', '    Source']), 'sql-server via Staging', 'a shared query');
+});
+
 module.exports = tests;
