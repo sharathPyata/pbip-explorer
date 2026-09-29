@@ -820,6 +820,7 @@ tr.row-unused td:first-child { font-style: italic; }
   line-height: 1.55;
   max-height: 160px; overflow: auto;
 }
+.measure-extra-label { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-3); margin: 8px 0 4px; }
 .measure-format {
   font-family: var(--mono); font-size: 10px;
   color: var(--text-3);
@@ -905,6 +906,7 @@ tr.row-unused td:first-child { font-style: italic; }
 }
 .rel-edge.highlight { stroke: var(--accent); stroke-width: 2.5; }
 .rel-edge.both { stroke-dasharray: 4,2; }
+.rel-edge.inactive { stroke-dasharray: 2,4; }
 .rel-edge.dim { opacity: 0.2; }
 
 .rel-side {
@@ -942,6 +944,7 @@ tr.row-unused td:first-child { font-style: italic; }
   border-radius: 3px;
   font-weight: 600;
 }
+.rel-list-flag.inactive { color: var(--text-2); background: var(--bg-3); border-color: var(--border); }
 
 /* ── Pages view ── */
 .page-card {
@@ -1205,7 +1208,7 @@ const App = {
     projectName: '',
     tables: [],           // [{name, description, columns:[], measures:[], partitionSource, mode, isHidden}]
     expressions: {},      // {name: {description, sourceM}}
-    relationships: [],    // [{id, fromTable, fromColumn, toTable, toColumn, crossFiltering, securityFiltering}]
+    relationships: [],    // [{id, fromTable, fromColumn, toTable, toColumn, crossFiltering, securityFiltering, isActive}]
     sources: [],          // [{key, name, type, server, description, queries:[tableName]}]
     pages: [],            // [{name, displayName, visuals:[{type, fields:[]}]}]
     modelAnnotations: {}, // raw annotations from model.tmdl / model.bim
@@ -1283,7 +1286,69 @@ function isPropertyLine(line) {
     || /^\t\tchangedProperty\s*=/.test(line)     // changedProperty = Name
     || /^\t\t\w*Definition\s*=/.test(line)       // formatStringDefinition, detailRowsDefinition, calculationGroupDefinition
     || /^\t\texpression\s*=/.test(line)          // shared expression definitions
+    || /^\t\tkpi\s*$/.test(line)                 // a measure's KPI (a child object, but it ends the DAX all the same)
   );
+}
+
+/* The value of a TMDL `name = expression` property on line i, whose text after the `=` is `first`:
+   on that line, in a ``` fence, or on the more deeply indented lines below it — the three forms a
+   measure's own DAX takes, used by a measure's formatStringDefinition / detailRowsDefinition and
+   its KPI's target / status / trend expressions. Returns the expression and its last line. */
+function readTmdlExpression(lines, i, first) {
+  first = (first || '').trim();
+  if (first.startsWith('```')) {
+    if (first.length > 6 && first.endsWith('```')) return { text: first.slice(3, -3).trim(), end: i };
+    const parts = [];
+    if (first.slice(3).trim()) parts.push(first.slice(3));
+    let k = i + 1;
+    for (; k < lines.length; k++) {
+      if (lines[k].includes('```')) {
+        const before = lines[k].split('```')[0];
+        if (before.trim()) parts.push(before);
+        break;
+      }
+      parts.push(lines[k]);
+    }
+    return { text: normalizeIndent(parts.join('\n')).trim(), end: Math.min(k, lines.length - 1) };
+  }
+  if (first) return { text: first, end: i };
+  const indent = lines[i].match(/^\t*/)[0].length;
+  const parts = [];
+  let end = i;
+  for (let k = i + 1; k < lines.length; k++) {
+    const ln = lines[k];
+    if (!ln.trim()) { if (parts.length) parts.push(''); continue; }
+    if (ln.match(/^\t*/)[0].length <= indent) break;
+    parts.push(ln);
+    end = k;
+  }
+  return { text: normalizeIndent(parts.join('\n')).trim(), end };
+}
+
+/* A measure's DAX beyond its expression, labelled: a dynamic format string, a detail-rows
+   expression, a KPI's target, status and trend. Each is evaluated whenever the measure is, so
+   the columns and measures they name are as used as the measure is. */
+function measureExtraDax(m) {
+  const out = [];
+  if (m.formatStringDax) out.push({ label: 'Format string', dax: m.formatStringDax });
+  if (m.kpi) {
+    if (m.kpi.target) out.push({ label: 'KPI target', dax: m.kpi.target });
+    if (m.kpi.status) out.push({ label: 'KPI status', dax: m.kpi.status });
+    if (m.kpi.trend) out.push({ label: 'KPI trend', dax: m.kpi.trend });
+  }
+  if (m.detailRowsDax) out.push({ label: 'Detail rows', dax: m.detailRowsDax });
+  return out;
+}
+
+/* Every column a calendar tags: each category's primary and associated columns, and its
+   time-related ones. */
+function calendarColumns(cal) {
+  return (cal.groups || []).flatMap(g => [g.primary, ...(g.associated || []), ...(g.columns || [])]).filter(Boolean);
+}
+/* A calendar category as the docs name it: monthOfYear → "Month of Year"; none → time-related. */
+function calendarUnitLabel(unit) {
+  if (!unit) return 'Time-related';
+  return unit.replace(/([A-Z])/g, ' $1').replace(/^./, c => c.toUpperCase()).replace(/ Of /g, ' of ');
 }
 function normalizeIndent(text) {
   if (!text) return '';
@@ -1402,10 +1467,42 @@ function parseTable(text) {
 
   // Hierarchy levels reference table columns: `level X { column: Y }`. Capture all referenced
   // columns so they're marked as structurally used (otherwise columns only used in hierarchies
-  // would be flagged as unused).
+  // would be flagged as unused). Only inside a hierarchy: a calendar's time-related columns are
+  // written the same way, three tabs deep, and are read as the calendar's below.
+  //
+  // Calendars (calendar-based time intelligence) say which columns stand for which unit of time,
+  // and DAX names them like tables — TOTALYTD([Sales], 'Fiscal'):
+  //   calendar Fiscal
+  //       calendarColumnGroup = year          ← a category: one primaryColumn, any associatedColumn
+  //           primaryColumn: 'Fiscal Year'
+  //       calendarColumnGroup                 ← no category: its columns are time-related
+  //           column: IsWorkingDay
   const hierColumnRefs = new Set();
-  for (const m of text.matchAll(/^\t\t\tcolumn:\s*(.+)$/gm)) {
-    hierColumnRefs.add(unquote(m[1].trim()));
+  const calendars = [];
+  let block = '', calendar = null, group = null;
+  for (const ln of text.split('\n')) {
+    let m;
+    if (/^\t[^\t]/.test(ln)) {
+      block = (ln.match(/^\t(\w+)/) || [])[1] || '';
+      calendar = group = null;
+      if (block === 'calendar' && (m = ln.match(/^\tcalendar\s+(.+?)\s*$/))) {
+        calendar = { name: unquote(m[1]), groups: [] };
+        calendars.push(calendar);
+      }
+    } else if (block === 'hierarchy') {
+      if ((m = ln.match(/^\t\t\tcolumn:\s*(.+)$/))) hierColumnRefs.add(unquote(m[1].trim()));
+    } else if (calendar) {
+      if ((m = ln.match(/^\t\tcalendarColumnGroup\b\s*(?:=\s*(\S+))?\s*$/))) {
+        group = { unit: m[1] || '', primary: '', associated: [], columns: [] };
+        calendar.groups.push(group);
+      } else if (/^\t\t[^\t]/.test(ln)) {
+        group = null;
+      } else if (group && (m = ln.match(/^\t\t\t(primaryColumn|associatedColumn|column):\s*(.+?)\s*$/))) {
+        const name = unquote(m[2]);
+        if (m[1] === 'primaryColumn') group.primary = name;
+        else (m[1] === 'associatedColumn' ? group.associated : group.columns).push(name);
+      }
+    }
   }
 
   // Measures: 3 DAX forms — single-line, triple-backtick fenced, or indented continuation
@@ -1458,13 +1555,22 @@ function parseTable(text) {
       i = Math.max(i, k - 1);
     }
 
-    // Look ahead for displayFolder/formatString (doesn't consume i)
-    let displayFolder = '', formatString = '';
+    // Look ahead for the measure's properties (doesn't consume i): displayFolder, formatString,
+    // and the rest of its DAX — a dynamic format string, a detail-rows expression, a KPI.
+    let displayFolder = '', formatString = '', formatStringDax = '', detailRowsDax = '', kpi = null;
     let j = i + 1;
     while (j < lines.length) {
       const pl = lines[j];
       if (!pl.trim()) { j++; continue; }
       if (pl.startsWith('\t\t') && !pl.startsWith('\t\t\t')) {
+        const dm = pl.match(/^\t\t(formatStringDefinition|detailRowsDefinition)\s*=\s*(.*)$/);
+        if (dm) {
+          const r = readTmdlExpression(lines, j, dm[2]);
+          if (dm[1] === 'formatStringDefinition') formatStringDax = r.text; else detailRowsDax = r.text;
+          j = r.end + 1;
+          continue;
+        }
+        if (/^\t\tkpi\s*$/.test(pl)) kpi = kpi || { target: '', status: '', trend: '' };
         const pm = pl.match(/^\t\t(\w+):\s*(.+)$/);
         if (pm) {
           if (pm[1] === 'displayFolder') displayFolder = pm[2].trim();
@@ -1474,10 +1580,18 @@ function parseTable(text) {
       } else if (pl.startsWith('\t') && !pl.startsWith('\t\t')) {
         break;
       } else {
+        // A KPI's expressions sit one level below its `kpi` line.
+        const km = kpi && pl.match(/^\t\t\t(target|status|trend)Expression\s*=\s*(.*)$/);
+        if (km) {
+          const r = readTmdlExpression(lines, j, km[2]);
+          kpi[km[1]] = r.text;
+          j = r.end + 1;
+          continue;
+        }
         j++;
       }
     }
-    measures.push({ name: mName, dax, displayFolder, formatString });
+    measures.push({ name: mName, dax, displayFolder, formatString, formatStringDax, detailRowsDax, kpi });
     i++;
   }
 
@@ -1667,6 +1781,7 @@ function parseTable(text) {
     isCalcGroup, calcItems, calcGroupPrecedence,
     annotations: tableAnnotations,
     hierColumnRefs: [...hierColumnRefs],
+    calendars,
   };
 }
 
@@ -1702,11 +1817,13 @@ function splitTableDocuments(text) {
    concatenated; scalar properties only fill in where the first declaration left a blank,
    so the document that actually carried the table's definition wins. */
 function mergeTableInto(target, extra) {
-  for (const key of ['columns', 'measures', 'hierarchies', 'calcItems']) {
+  // Hierarchies and hierarchy-level columns are plain names; the rest are named objects.
+  const id = o => (o && typeof o === 'object' ? o.name : o);
+  for (const key of ['columns', 'measures', 'hierarchies', 'calcItems', 'calendars', 'hierColumnRefs']) {
     if (!Array.isArray(extra[key]) || !extra[key].length) continue;
     if (!Array.isArray(target[key])) target[key] = [];
-    const seen = new Set(target[key].map(o => o && o.name));
-    for (const item of extra[key]) if (!item || !seen.has(item.name)) target[key].push(item);
+    const seen = new Set(target[key].map(id));
+    for (const item of extra[key]) if (!item || !seen.has(id(item))) target[key].push(item);
   }
   for (const key of ['description', 'partitionSource', 'partitionKind', 'mode']) {
     if (!target[key] && extra[key]) target[key] = extra[key];
@@ -1776,11 +1893,29 @@ function parseTmslModel(bim) {
     const measures = [];
     for (const m of (t.measures || [])) {
       if (!m || !m.name) continue;
+      const k = m.kpi || null;
       measures.push({
         name: m.name,
         dax: tmslText(m.expression).trim(),
         displayFolder: String(m.displayFolder || '').trim(),
         formatString: String(m.formatString || '').trim(),
+        formatStringDax: tmslText(m.formatStringDefinition && m.formatStringDefinition.expression).trim(),
+        detailRowsDax: tmslText(m.detailRowsDefinition && m.detailRowsDefinition.expression).trim(),
+        kpi: k ? { target: tmslText(k.targetExpression).trim(), status: tmslText(k.statusExpression).trim(), trend: tmslText(k.trendExpression).trim() } : null,
+      });
+    }
+
+    // Calendars: calendarColumnGroups of { timeUnit, primaryColumn, associatedColumns } for a
+    // category, or { columns } for time-related columns — the TMDL parser's shape.
+    const calendars = [];
+    for (const cal of (t.calendars || [])) {
+      if (!cal || !cal.name) continue;
+      calendars.push({
+        name: cal.name,
+        groups: (cal.calendarColumnGroups || []).filter(Boolean).map(g => ({
+          unit: g.timeUnit || '', primary: g.primaryColumn || '',
+          associated: [].concat(g.associatedColumns || []), columns: [].concat(g.columns || []),
+        })),
       });
     }
 
@@ -1836,6 +1971,7 @@ function parseTmslModel(bim) {
       calcGroupPrecedence: cg && cg.precedence != null ? cg.precedence : null,
       annotations: tmslAnnotations(t.annotations),
       hierColumnRefs: [...hierColumnRefs],
+      calendars,
     });
   }
   tables.sort((a, b) => a.name.localeCompare(b.name));
@@ -1858,6 +1994,7 @@ function parseTmslModel(bim) {
       toTable: r.toTable, toColumn: r.toColumn || '',
       crossFiltering: r.crossFilteringBehavior || 'singleDirection',
       securityFiltering: r.securityFilteringBehavior || '',
+      isActive: r.isActive !== false,
     });
   }
 
@@ -2025,10 +2162,12 @@ function parseRelationships(text) {
     const [toTable, toColumn] = splitTableColumn(to);
     const crossFiltering = (block.match(/crossFilteringBehavior:\s*(\w+)/) || [])[1] || 'singleDirection';
     const securityFiltering = (block.match(/securityFilteringBehavior:\s*(\w+)/) || [])[1] || '';
+    // An inactive relationship doesn't filter until a measure turns it on with USERELATIONSHIP.
+    const isActive = !/^\tisActive:\s*false\s*$/m.test(block);
     rels.push({
       id: idMatch[1].trim(),
       fromTable, fromColumn, toTable, toColumn,
-      crossFiltering, securityFiltering,
+      crossFiltering, securityFiltering, isActive,
     });
   }
   return rels;
@@ -2066,39 +2205,78 @@ function parseQueryRef(ref) {
   return { table: (m[1] || m[2]).trim(), field };
 }
 
-/* Model tables a DAX expression names, 'quoted' or as a bare identifier. String literals, comments
-   and [bracketed] names are skipped: an apostrophe inside "It's" must not open a phantom quoted
-   name, and a measure called [Sales Amount] doesn't name a table called Sales. */
-function daxTablesNamed(dax, byName) {
-  const found = new Set();
-  const re = /"(?:[^"]|"")*"|\/\/[^\n]*|--[^\n]*|\/\*[\s\S]*?\*\/|\[(?:[^\]]|\]\])*\]|'((?:[^']|'')+)'|([A-Za-z_]\w*)/g;
-  let m;
-  while ((m = re.exec(dax))) {
-    const name = m[1] !== undefined ? m[1].replace(/''/g, "'") : m[2];
-    if (name !== undefined && byName.has(name)) found.add(name);
+/* DAX ignores case in names — the RuiRomano demo's calculation group writes 'Time intelligence'[Show as]
+   for the table 'Time Intelligence' — so names are looked up case-insensitively and come back in the
+   model's own spelling: tables (with their columns and measures), measures and columns by name, and
+   calendars, each with the columns it tags. */
+function daxModelIndex() {
+  const lc = s => String(s).toLowerCase();
+  const tables = new Map(), measures = new Map(), columns = new Map(), calendars = new Map();
+  for (const t of App.state.tables) {
+    const entry = { name: t.name, columns: new Map(), measures: new Map() };
+    for (const c of t.columns) {
+      entry.columns.set(lc(c.name), c.name);
+      columns.set(lc(c.name), [...(columns.get(lc(c.name)) || []), `${t.name}.${c.name}`]);
+    }
+    for (const m of t.measures) {
+      entry.measures.set(lc(m.name), m.name);
+      if (!measures.has(lc(m.name))) measures.set(lc(m.name), `${t.name}.${m.name}`);
+    }
+    if (!tables.has(lc(t.name))) tables.set(lc(t.name), entry);
+    for (const cal of (t.calendars || [])) {
+      if (!calendars.has(lc(cal.name))) calendars.set(lc(cal.name), calendarColumns(cal).map(c => `${t.name}.${c}`));
+    }
   }
+  return { tables, measures, columns, calendars };
+}
+
+/* What a DAX expression names the way it names tables and calendars — 'quoted', or a bare identifier
+   — lowercased. Skipped: string literals, comments and [bracketed] names (an apostrophe inside "It's"
+   must not open a phantom quoted name, and a measure called [Sales Amount] doesn't name a table
+   called Sales), function calls (DATE( isn't the table Date), keywords, and the expression's own
+   VAR names. */
+const DAX_KEYWORDS = new Set(['var', 'return', 'in', 'not', 'and', 'or', 'true', 'false']);
+function daxNamesUsed(dax) {
+  const found = new Set(), vars = new Set();
+  const re = /"(?:[^"]|"")*"|\/\/[^\n]*|--[^\n]*|\/\*[\s\S]*?\*\/|\[(?:[^\]]|\]\])*\]|'((?:[^']|'')+)'|([A-Za-z_]\w*)(\s*\()?/g;
+  let m, prev = '';
+  while ((m = re.exec(dax || ''))) {
+    const word = m[2] !== undefined ? m[2].toLowerCase() : '';
+    if (m[1] !== undefined) found.add(m[1].replace(/''/g, "'").toLowerCase());
+    else if (word && !m[3] && !DAX_KEYWORDS.has(word)) (prev === 'var' ? vars : found).add(word);
+    prev = word;
+  }
+  for (const v of vars) found.delete(v);
   return found;
 }
 
-/* Columns and measures a DAX expression references. `homeTable` is the table the expression lives
-   on — a measure's or calculated column's table, or the table an RLS filter guards — which is
-   where an unqualified [Name] looks for its column. */
-function parseDaxReferences(dax, homeTable) {
+/* Columns and measures a DAX expression references, as model keys ("Table.Name" in the model's own
+   spelling). `homeTable` is the table the expression lives on — a measure's or calculated column's
+   table, or the table an RLS filter guards — which is where an unqualified [Name] looks for its
+   column. A calendar the expression names (TOTALYTD([Sales], 'Fiscal')) counts as a reference to
+   every column it tags: the time intelligence runs on them, and removing any breaks the calendar. */
+function parseDaxReferences(dax, homeTable, ix) {
   const cols = new Set();
   const meas = new Set();
   if (!dax) return { columns: cols, measures: meas };
-  const byName = new Map(App.state.tables.map(t => [t.name, t]));
+  ix = ix || daxModelIndex();
+  const lc = s => String(s).toLowerCase();
   // Table[Field] or 'Table'[Field] — an apostrophe inside a quoted name is doubled: 'Client''s Spend'
   const refRe = /(?:'((?:[^']|'')+)'|([A-Za-z_]\w*))\[([^\]]+)\]/g;
   let m;
   while ((m = refRe.exec(dax))) {
     const tbl = m[1] !== undefined ? m[1].replace(/''/g, "'").trim() : m[2];
-    const fld = m[3].trim();
-    const t = byName.get(tbl);
+    const fld = lc(m[3].trim());
+    const t = ix.tables.get(lc(tbl));
     if (t) {
-      if (t.columns.some(c => c.name === fld)) cols.add(`${tbl}.${fld}`);
-      if (t.measures.some(mm => mm.name === fld)) meas.add(`${tbl}.${fld}`);
+      if (t.columns.has(fld)) cols.add(`${t.name}.${t.columns.get(fld)}`);
+      if (t.measures.has(fld)) meas.add(`${t.name}.${t.measures.get(fld)}`);
     }
+  }
+  let named = null;   // what the expression names, looked up once
+  if (ix.calendars.size) {
+    named = daxNamesUsed(dax);
+    for (const n of named) for (const k of (ix.calendars.get(n) || [])) cols.add(k);
   }
   // Bare [Name]. A measure is always referenced this way, but so is a column wherever a row context
   // supplies the table — the norm in calculated columns ([Qty] * [Price]) and RLS filters
@@ -2111,28 +2289,19 @@ function parseDaxReferences(dax, homeTable) {
   const bareRe = /(?<![A-Za-z0-9_'\]])\[([^\]]+)\]/g;
   let candidates = null;
   while ((m = bareRe.exec(dax))) {
-    const name = m[1].trim();
-    let isMeasure = false;
-    for (const t of App.state.tables) {
-      if (t.measures.some(mm => mm.name === name)) {
-        meas.add(`${t.name}.${name}`);
-        isMeasure = true;
-        break;
-      }
-    }
+    const name = lc(m[1].trim());
+    const measure = ix.measures.get(name);
+    if (measure) meas.add(measure);
     if (!candidates) {
-      candidates = daxTablesNamed(dax, byName);
-      if (byName.has(homeTable)) candidates.add(homeTable);
+      candidates = [...(named || (named = daxNamesUsed(dax)))].map(n => ix.tables.get(n)).filter(Boolean);
+      const home = homeTable != null && ix.tables.get(lc(homeTable));
+      if (home && !candidates.includes(home)) candidates.push(home);
     }
     let found = false;
-    for (const tn of candidates) {
-      if (byName.get(tn).columns.some(c => c.name === name)) { cols.add(`${tn}.${name}`); found = true; }
+    for (const t of candidates) {
+      if (t.columns.has(name)) { cols.add(`${t.name}.${t.columns.get(name)}`); found = true; }
     }
-    if (!found && !isMeasure) {
-      for (const t of App.state.tables) {
-        if (t.columns.some(c => c.name === name)) cols.add(`${t.name}.${name}`);
-      }
-    }
+    if (!found && !measure) for (const k of (ix.columns.get(name) || [])) cols.add(k);
   }
   return { columns: cols, measures: meas };
 }
@@ -2307,8 +2476,11 @@ function detectSource(mCode, expressions, tablesList, visited) {
     }
   }
 
-  // 2. Inline data
-  if (/Table\.FromRecords|Table\.FromRows|Table\.FromList/.test(mCode)) {
+  // 2. Inline data — rows typed into the query. Table.FromList over a list the query generates
+  //    isn't that: it's how Microsoft's recommended M date table is built (List.Dates, then
+  //    Table.FromList), and it's computed, like the #table cases below.
+  const generatesList = /List\.(?:Dates|DateTimes|Times|Durations|Numbers|Generate)\s*\(/.test(mCode);
+  if (/Table\.FromRecords|Table\.FromRows/.test(mCode) || (/Table\.FromList/.test(mCode) && !generatesList)) {
     return { key: 'inline', name: 'Inline Data', type: 'other', server: '' };
   }
 
@@ -2334,7 +2506,7 @@ function detectSource(mCode, expressions, tablesList, visited) {
   // No connector and no upstream table: if the query manufactures its own rows
   // (#table / Table.FromValue / a generated list) it genuinely has no external
   // source, which is worth distinguishing from an unrecognised connector.
-  if (/#table\s*\(|Table\.FromValue\s*\(|List\.(?:Numbers|Dates|Generate)\s*\(/.test(mCode)) {
+  if (/#table\s*\(|Table\.FromValue\s*\(/.test(mCode) || generatesList) {
     return { key: 'computed', name: 'Computed', type: 'other', server: 'No external source' };
   }
   return viaUnknown || { key: 'unknown', name: 'Unknown', type: 'other', server: '' };
@@ -3171,6 +3343,11 @@ function buildUsageIndex() {
       };
     }
   }
+  // The engine matches names case-insensitively, so a reference in another case — a report binding
+  // left behind by a rename, 'Time intelligence'[Show as] in DAX — is still a use of the field.
+  const byLowerKey = new Map(Object.keys(byKey).map(k => [k.toLowerCase(), k]));
+  const entry = (k) => byKey[k] || byKey[byLowerKey.get(String(k).toLowerCase())];
+  const ix = daxModelIndex();
 
   // 1. Direct from visual projections
   for (const page of App.state.pages) {
@@ -3178,8 +3355,8 @@ function buildUsageIndex() {
       for (const f of v.fields) {
         const r = parseQueryRef(f.ref);
         if (!r) continue;
-        const key = `${r.table}.${r.field}`;
-        if (byKey[key]) byKey[key].direct.push(`"${page.displayName}" · ${v.type}`);
+        const e = entry(`${r.table}.${r.field}`);
+        if (e) e.direct.push(`"${page.displayName}" · ${v.type}`);
       }
     }
   }
@@ -3187,32 +3364,38 @@ function buildUsageIndex() {
   // 2. Direct from full report scan (catches filters and other references)
   const reportRefs = App.state.reportReferences || new Set();
   for (const refKey of reportRefs) {
-    if (byKey[refKey] && byKey[refKey].direct.length === 0) {
-      byKey[refKey].direct.push('report (filter or binding)');
-    }
+    const e = entry(refKey);
+    if (e && e.direct.length === 0) e.direct.push('report (filter or binding)');
   }
 
   // 3. Structural — relationships
   for (const r of App.state.relationships) {
-    const fk = `${r.fromTable}.${r.fromColumn}`;
-    const tk = `${r.toTable}.${r.toColumn}`;
-    if (byKey[fk]) byKey[fk].structural.push(`relationship → ${r.toTable}`);
-    if (byKey[tk]) byKey[tk].structural.push(`relationship ← ${r.fromTable}`);
+    const from = entry(`${r.fromTable}.${r.fromColumn}`), to = entry(`${r.toTable}.${r.toColumn}`);
+    if (from) from.structural.push(`relationship → ${r.toTable}`);
+    if (to) to.structural.push(`relationship ← ${r.fromTable}`);
   }
 
-  // 4. Structural — sortByColumn and hierarchy levels (both keep columns "alive")
+  // 4. Structural — sortByColumn, hierarchy levels and calendars (all keep columns "alive")
   for (const t of App.state.tables) {
     for (const c of t.columns) {
       if (c.sortByColumn) {
-        const target = `${t.name}.${c.sortByColumn}`;
-        if (byKey[target]) byKey[target].structural.push(`sortBy from [${c.name}]`);
+        const e = entry(`${t.name}.${c.sortByColumn}`);
+        if (e) e.structural.push(`sortBy from [${c.name}]`);
       }
     }
     // Hierarchy level → column references (column belongs to same table)
     if (Array.isArray(t.hierColumnRefs)) {
       for (const colName of t.hierColumnRefs) {
-        const k = `${t.name}.${colName}`;
-        if (byKey[k]) byKey[k].structural.push('hierarchy level');
+        const e = entry(`${t.name}.${colName}`);
+        if (e) e.structural.push('hierarchy level');
+      }
+    }
+    // A calendar tags its own table's columns. Unreferenced it's curation, like a hierarchy; a DAX
+    // expression naming it makes its columns used (see parseDaxReferences).
+    for (const cal of (t.calendars || [])) {
+      for (const colName of new Set(calendarColumns(cal))) {
+        const e = entry(`${t.name}.${colName}`);
+        if (e) e.structural.push(`calendar '${cal.name}'`);
       }
     }
   }
@@ -3222,7 +3405,7 @@ function buildUsageIndex() {
   //     as a direct use, not structural, because there is nothing optional about it.
   for (const role of (App.state.roles || [])) {
     for (const tp of (role.tablePermissions || [])) {
-      const { columns, measures } = parseDaxReferences(tp.dax, tp.table);
+      const { columns, measures } = parseDaxReferences(tp.dax, tp.table, ix);
       for (const k of [...columns, ...measures]) {
         if (byKey[k]) byKey[k].direct.push(`RLS role "${role.name}"`);
       }
@@ -3234,7 +3417,7 @@ function buildUsageIndex() {
   //      over-reporting a field as used is recoverable, wrongly clearing one for deletion
   //      is not.
   for (const fn of (App.state.functions || [])) {
-    const { columns, measures } = parseDaxReferences(fn.dax);
+    const { columns, measures } = parseDaxReferences(fn.dax, null, ix);
     for (const k of [...columns, ...measures]) {
       if (byKey[k]) byKey[k].direct.push(`DAX function ${fn.name}()`);
     }
@@ -3245,8 +3428,8 @@ function buildUsageIndex() {
   //     is structural rather than direct.
   for (const persp of (App.state.perspectives || [])) {
     for (const mem of (persp.members || [])) {
-      const k = `${mem.table}.${mem.name}`;
-      if (byKey[k]) byKey[k].structural.push(`perspective "${persp.name}"`);
+      const e = entry(`${mem.table}.${mem.name}`);
+      if (e) e.structural.push(`perspective "${persp.name}"`);
     }
   }
 
@@ -3263,14 +3446,21 @@ function buildUsageIndex() {
   const calcItemDax = []; // { table, label, refs: [{ columns, measures }, ...] }
   for (const t of App.state.tables) {
     for (const m of t.measures) {
+      // A measure's dynamic format string, KPI and detail-rows DAX run whenever it does.
       const k = `${t.name}.${m.name}`;
-      exprDax[k] = parseDaxReferences(m.dax, t.name);
+      const refs = parseDaxReferences(m.dax, t.name, ix);
+      for (const x of measureExtraDax(m)) {
+        const more = parseDaxReferences(x.dax, t.name, ix);
+        for (const r of more.columns) refs.columns.add(r);
+        for (const r of more.measures) refs.measures.add(r);
+      }
+      exprDax[k] = refs;
       exprLabel[k] = `[${m.name}]`;
     }
     for (const c of t.columns) {
       if (c.calcDax) {
         const k = `${t.name}.${c.name}`;
-        exprDax[k] = parseDaxReferences(c.calcDax, t.name);
+        exprDax[k] = parseDaxReferences(c.calcDax, t.name, ix);
         exprLabel[k] = `calc col [${c.name}]`;
       }
     }
@@ -3278,7 +3468,7 @@ function buildUsageIndex() {
       calcItemDax.push({
         table: t,
         label: `calc item [${ci.name}]`,
-        refs: [parseDaxReferences(ci.dax, t.name), parseDaxReferences(ci.formatStringDefinition, t.name)],
+        refs: [parseDaxReferences(ci.dax, t.name, ix), parseDaxReferences(ci.formatStringDefinition, t.name, ix)],
       });
     }
   }
@@ -3402,26 +3592,21 @@ function buildUsageIndex() {
     if (t.partitionKind !== 'calculated' || !t.partitionSource) continue;
     if (!tableIsUsed(t.name)) continue;
     // Match NAMEOF('Table'[Field]) — with or without the table prefix.
-    const nameOfRe = /NAMEOF\s*\(\s*(?:'([^']+)')?\s*\[([^\]]+)\]\s*\)/g;
+    const nameOfRe = /NAMEOF\s*\(\s*(?:'([^']+)')?\s*\[([^\]]+)\]\s*\)/gi;
     let m;
     while ((m = nameOfRe.exec(t.partitionSource))) {
       let table = m[1] || '';
       const field = m[2];
       if (!table) {
         // Bare [Field] — find the first table that has this column or measure
-        for (const tt of App.state.tables) {
-          if (tt.columns.find(c => c.name === field) || tt.measures.find(mm => mm.name === field)) {
-            table = tt.name;
-            break;
-          }
-        }
+        const lf = field.toLowerCase();
+        const tt = App.state.tables.find(x => x.columns.some(c => c.name.toLowerCase() === lf) || x.measures.some(mm => mm.name.toLowerCase() === lf));
+        if (tt) table = tt.name;
       }
       if (!table) continue;
-      const cKey = `${table}.${field}`;
+      const e = entry(`${table}.${field}`);
       const reason = `field parameter [${t.name}]`;
-      if (byKey[cKey] && !byKey[cKey].direct.includes(reason) && !byKey[cKey].transitive.includes(reason)) {
-        byKey[cKey].transitive.push(reason);
-      }
+      if (e && !e.direct.includes(reason) && !e.transitive.includes(reason)) e.transitive.push(reason);
     }
   }
 
@@ -3468,9 +3653,12 @@ function daxQualifiedRefs(dax) {
    what the shared model must keep for this report to work. Only bindings count, not queryRef
    names: with no model to match them against, a stale name would be listed as a field. */
 function reportFieldsUsed() {
+  // Names match case-insensitively, as the engine matches them; the first spelling seen — a
+  // visual's binding before any DAX — is the one listed.
   const s = App.state, fields = new Map();
+  const keyOf = (table, field) => `${table}.${field}`.toLowerCase();
   const entry = (table, field) => {
-    const k = `${table}.${field}`;
+    const k = keyOf(table, field);
     if (!fields.has(k)) fields.set(k, { table, field, visuals: 0, other: false, measures: new Set() });
     return fields.get(k);
   };
@@ -3479,8 +3667,8 @@ function reportFieldsUsed() {
       const seen = new Set();
       for (const f of v.fields) {
         const r = parseQueryRef(f.ref);
-        if (!r || seen.has(`${r.table}.${r.field}`)) continue;
-        seen.add(`${r.table}.${r.field}`);
+        if (!r || seen.has(keyOf(r.table, r.field))) continue;
+        seen.add(keyOf(r.table, r.field));
         entry(r.table, r.field).visuals++;
       }
     }
@@ -3492,8 +3680,8 @@ function reportFieldsUsed() {
   for (const rm of (s.reportMeasures || [])) {
     for (const r of daxQualifiedRefs(rm.dax)) entry(r.table, r.field).measures.add(rm.name);
   }
-  const own = new Set((s.reportMeasures || []).map(m => `${m.table}.${m.name}`));
-  return [...fields.values()].filter(e => !own.has(`${e.table}.${e.field}`))
+  const own = new Set((s.reportMeasures || []).map(m => keyOf(m.table, m.name)));
+  return [...fields.values()].filter(e => !own.has(keyOf(e.table, e.field)))
     .sort((a, b) => a.table.localeCompare(b.table) || a.field.localeCompare(b.field));
 }
 
@@ -4121,7 +4309,9 @@ function renderOverview() {
   if (!App.state.tables.length) { c.innerHTML = ''; return; }
   const totalCols = countAllColumns();
   const totalMeas = countAllMeasures();
-  const sources = App.state.sources;
+  // The same sources the Sources tab and its badge count: ones whose tables are all hidden (auto
+  // date tables) drop out along with those tables.
+  const sources = visibleSources();
   const visTables = visibleTables();
   const hiddenCount = countHiddenTables();
   const visNames = new Set(visTables.map(t => t.name));
@@ -4405,6 +4595,7 @@ function renderTableDetail() {
         <div class="detail-meta-item"><span class="dot blue"></span> ${t.columns.length} columns</div>
         <div class="detail-meta-item"><span class="dot purple"></span> ${t.measures.length} measures</div>
         ${t.hierarchies.length ? `<div class="detail-meta-item"><span class="dot yellow"></span> ${t.hierarchies.length} hierarch${t.hierarchies.length===1?'y':'ies'}</div>` : ''}
+        ${t.calendars && t.calendars.length ? `<div class="detail-meta-item"><span class="dot yellow"></span> ${t.calendars.length} calendar${t.calendars.length===1?'':'s'}</div>` : ''}
         ${t.calcItems && t.calcItems.length ? `<div class="detail-meta-item"><span class="dot purple"></span> ${t.calcItems.length} calc items</div>` : ''}
         ${t.calcGroupPrecedence != null ? `<div class="detail-meta-item"><span class="dot yellow"></span> precedence: <code>${esc(t.calcGroupPrecedence)}</code></div>` : ''}
         ${(kind === 'auto-date' || kind === 'date-template') && autoDateSourceFor(t.name) ? `<div class="detail-meta-item" style="background:var(--purple-light);padding:3px 8px;border-radius:4px"><span style="color:var(--purple);font-weight:600">Generated for</span> <span style="font-family:var(--mono)">${esc(autoDateSourceFor(t.name))}</span></div>` : ''}
@@ -4436,6 +4627,28 @@ function renderTableDetail() {
       </div>
     </div>
 
+    ${t.calendars && t.calendars.length ? `
+    <div class="subsection">
+      <div class="subsection-header open"><span class="arrow">▶</span>Calendars <span class="pill">${t.calendars.length}</span></div>
+      <div class="subsection-body">
+        ${t.calendars.map(cal => `
+          <div style="margin-bottom:12px">
+            <div style="font-family:var(--mono);font-weight:600;margin-bottom:6px">${esc(cal.name)}</div>
+            <table class="columns-table">
+              <thead><tr><th>Category</th><th>Columns</th></tr></thead>
+              <tbody>
+                ${cal.groups.map(g => `<tr><td>${esc(calendarUnitLabel(g.unit))}</td><td>${[
+                  ...(g.primary ? [`${esc(g.primary)} <span style="color:var(--text-3)">(primary)</span>`] : []),
+                  ...[...g.associated, ...g.columns].map(esc),
+                ].join(', ')}</td></tr>`).join('')}
+              </tbody>
+            </table>
+          </div>
+        `).join('')}
+      </div>
+    </div>
+    ` : ''}
+
     ${t.measures.length ? `
     <div class="subsection">
       <div class="subsection-header open"><span class="arrow">▶</span>Measures <span class="pill">${t.measures.length}</span></div>
@@ -4452,6 +4665,7 @@ function renderTableDetail() {
                   ${m.formatString ? `<div class="measure-format">${esc(m.formatString)}</div>` : ''}
                 </div>
                 <pre class="measure-dax">${esc(m.dax)}</pre>
+                ${measureExtrasHtml(m, '')}
               </div>
             `;}).join('')}
           </div>
@@ -4474,6 +4688,7 @@ function renderTableDetail() {
             <div class="rel-list-arrow">↓</div>
             <div class="rel-list-to"><span>${esc(other)}[${esc(theirCol)}]</span></div>
             ${r.crossFiltering === 'bothDirections' ? '<span class="rel-list-flag">both directions</span>' : ''}
+            ${r.isActive === false ? '<span class="rel-list-flag inactive" title="Filters nothing until a measure turns it on with USERELATIONSHIP">inactive</span>' : ''}
           </div>`;
         }).join('')}
       </div>
@@ -4654,6 +4869,7 @@ function renderMeasures() {
   const filtered = all.filter(m =>
     !filter || m.name.toLowerCase().includes(filter) ||
     m.dax.toLowerCase().includes(filter) ||
+    measureExtraDax(m).some(x => x.dax.toLowerCase().includes(filter)) ||
     m.table.toLowerCase().includes(filter) ||
     (m.displayFolder||'').toLowerCase().includes(filter)
   );
@@ -4689,6 +4905,7 @@ function renderMeasures() {
                 ${m.formatString ? `<div class="measure-format">${esc(m.formatString)}</div>` : ''}
               </div>
               <pre class="measure-dax">${highlight(m.dax, filter)}</pre>
+              ${measureExtrasHtml(m, filter)}
             </div>
           `;}).join('')}
         </div>
@@ -4753,12 +4970,27 @@ function drawGraph() {
       source: r.fromTable,
       target: r.toTable,
       both: r.crossFiltering === 'bothDirections',
+      inactive: r.isActive === false,
       fromCol: r.fromColumn,
       toCol: r.toColumn,
       rel: r,
     });
     idMap[r.fromTable].degree++;
     idMap[r.toTable].degree++;
+  }
+  // Relationships between the same two tables — an active Order Date and an inactive Delivery Date
+  // to one Date table, the usual role-playing date — would be drawn on top of each other, hiding the
+  // inactive one. Space them apart sideways (`offset`, in px, relative to the pair's sorted order).
+  const pairs = new Map();
+  for (const l of links) {
+    const k = [l.source, l.target].sort().join('\u0000');
+    pairs.set(k, [...(pairs.get(k) || []), l]);
+  }
+  for (const group of pairs.values()) {
+    group.forEach((l, i) => {
+      const off = (i - (group.length - 1) / 2) * 10;
+      l.offset = l.source > l.target ? -off : off;
+    });
   }
 
   const W = host.clientWidth || 800;
@@ -4806,10 +5038,12 @@ function drawGraph() {
   const linkSel = linkGroup.selectAll('line')
     .data(links)
     .join('line')
-    .attr('class', d => 'rel-edge' + (d.both ? ' both' : ''))
+    .attr('class', d => 'rel-edge' + (d.both ? ' both' : '') + (d.inactive ? ' inactive' : ''))
     .attr('stroke', '#7a8a82')
     .attr('stroke-width', 1.6)
-    .attr('stroke-dasharray', d => d.both ? '5,3' : null)
+    // Dotted and fainter: an inactive relationship filters nothing until USERELATIONSHIP turns it on.
+    .attr('stroke-dasharray', d => d.inactive ? '2,4' : d.both ? '5,3' : null)
+    .attr('opacity', d => d.inactive ? 0.7 : 1)
     .attr('marker-end', d => d.both ? null : 'url(#rel-arrow)')
     .on('mouseover', function() { d3.select(this).attr('stroke', '#4a8c5e').attr('stroke-width', 2.5); })
     .on('mouseout', function(_, d) {
@@ -4817,7 +5051,7 @@ function drawGraph() {
       const hl = active && (d.source.id === active || d.target.id === active);
       d3.select(this).attr('stroke', hl ? '#4a8c5e' : '#7a8a82').attr('stroke-width', hl ? 2.5 : 1.6);
     });
-  linkSel.append('title').text(d => `${d.source.id || d.source}[${d.fromCol}]  →  ${d.target.id || d.target}[${d.toCol}]${d.both ? '  (both directions)' : ''}`);
+  linkSel.append('title').text(d => `${d.source.id || d.source}[${d.fromCol}]  →  ${d.target.id || d.target}[${d.toCol}]${d.both ? '  (both directions)' : ''}${d.inactive ? '  (inactive)' : ''}`);
 
   // Nodes
   const nodeGroup = g.append('g').attr('class', 'rel-nodes');
@@ -4888,8 +5122,13 @@ function drawGraph() {
     .force('y', d3.forceY(H / 2).strength(0.03))
     .on('tick', () => {
       linkSel
-        .attr('x1', d => d.source.x).attr('y1', d => d.source.y)
-        .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+        .each(d => {
+          const dx = d.target.x - d.source.x, dy = d.target.y - d.source.y, len = Math.hypot(dx, dy) || 1;
+          d.ox = d.offset ? -dy / len * d.offset : 0;
+          d.oy = d.offset ? dx / len * d.offset : 0;
+        })
+        .attr('x1', d => d.source.x + d.ox).attr('y1', d => d.source.y + d.oy)
+        .attr('x2', d => d.target.x + d.ox).attr('y2', d => d.target.y + d.oy);
       nodeSel.attr('transform', d => `translate(${d.x},${d.y})`);
     });
 
@@ -4913,7 +5152,7 @@ function drawGraph() {
     linkSel
       .attr('stroke', d => (active && (d.source.id === active || d.target.id === active)) ? '#4a8c5e' : '#7a8a82')
       .attr('stroke-width', d => (active && (d.source.id === active || d.target.id === active)) ? 2.5 : 1.6)
-      .attr('opacity', d => (active && !(d.source.id === active || d.target.id === active)) ? 0.15 : 1)
+      .attr('opacity', d => (active && !(d.source.id === active || d.target.id === active)) ? 0.15 : (d.inactive ? 0.7 : 1))
       .attr('marker-end', d => d.both ? null : (active && (d.source.id === active || d.target.id === active) ? 'url(#rel-arrow-hl)' : 'url(#rel-arrow)'));
     const side = document.getElementById('relSide');
     if (side) {
@@ -4960,6 +5199,7 @@ function drawRelList() {
         <div class="rel-list-arrow">${r.crossFiltering === 'bothDirections' ? '↕' : '↓'}</div>
         <div class="rel-list-to"><span style="color:var(--accent);font-weight:600">${esc(r.toTable)}</span><span style="color:var(--text-2)">[${esc(r.toColumn)}]</span></div>
         ${r.crossFiltering === 'bothDirections' ? '<span class="rel-list-flag">both directions</span>' : ''}
+        ${r.isActive === false ? '<span class="rel-list-flag inactive" title="Filters nothing until a measure turns it on with USERELATIONSHIP">inactive</span>' : ''}
       </div>
     `).join('') || '<div style="color:var(--text-3);font-style:italic">No relationships</div>'}
   `;
@@ -5492,7 +5732,7 @@ function renderNotes() {
     <ul>
       <li>Bare identifier: <code>table Sales</code> → "Sales"</li>
       <li>Quoted with spaces or special chars: <code>table 'Salesperson (Performance)'</code> → "Salesperson (Performance)"</li>
-      <li>Unquoting handles <code>""</code> → <code>"</code> inside quoted identifiers</li>
+      <li>Unquoting handles <code>''</code> → <code>'</code> inside quoted identifiers — TMDL escapes an apostrophe by doubling it: <code>'Client''s Spend'</code> → "Client's Spend"</li>
     </ul>
 
     <h3>3.2 Measure DAX — three TMDL forms (also applies to calc items)</h3>
@@ -5517,10 +5757,11 @@ function renderNotes() {
         VAR Prior = CALCULATE(SUM(Sales[Sales]), SAMEPERIODLASTYEAR('Date'[Date]))
         RETURN DIVIDE(SUM(Sales[Sales]) - Prior, Prior)
     formatString: 0.00%;-0.00%;0.00%</pre></td>
-          <td>Yes — reads until a property line (<code>foo:</code>, <code>annotation X =</code>, <code>changedProperty =</code>, <code>fooDefinition =</code>, <code>is&lt;Flag&gt;</code>) or the next 1-tab item</td>
+          <td>Yes — reads until a property line (<code>foo:</code>, <code>annotation X =</code>, <code>changedProperty =</code>, <code>fooDefinition =</code>, <code>is&lt;Flag&gt;</code>, <code>kpi</code>) or the next 1-tab item</td>
         </tr>
       </tbody>
     </table>
+    <p>A measure's other DAX takes the same three forms, indented under its own line: <code>formatStringDefinition =</code> (a dynamic format string — microsoft/fabric-toolbox's FCA model switches on a currency column this way), <code>detailRowsDefinition =</code>, and a <code>kpi</code> block's <code>targetExpression</code> / <code>statusExpression</code> / <code>trendExpression</code>. All of it is shown under the measure in the Measures and Tables tabs and in the export, and counts toward usage whenever the measure is used (9.1).</p>
 
     <h3>3.3 Partition source M code — same three forms</h3>
     <p>Identical handling to measure DAX. The fix here was important: Power BI Desktop emits triple-backticks for any non-trivial M block (multi-step queries, joins, conditional logic), so without this case <em>most</em> real-world tables would be classified as "Unknown" source.</p>
@@ -5534,6 +5775,21 @@ function renderNotes() {
       <li><code>changedProperty\\s*=</code></li>
       <li><code>\\w*Definition\\s*=</code> — <code>formatStringDefinition</code>, <code>detailRowsDefinition</code>, <code>calculationGroupDefinition</code></li>
       <li><code>expression\\s*=</code></li>
+      <li><code>kpi</code> — a measure's KPI block (a child object rather than a property, but it ends the DAX all the same: before it did, a KPI written right after a multi-line measure was read as part of the measure's DAX)</li>
+    </ul>
+
+    <h3>3.5 Calendars (calendar-based time intelligence)</h3>
+    <p>A calendar says which of its table's columns stand for which unit of time, and DAX names it the way it names a table: <code>TOTALYTD([Sales], 'Fiscal')</code>, <code>DATEADD(Gregorian, -1, YEAR)</code>.</p>
+    <pre>calendar Fiscal
+    calendarColumnGroup = year          ← a category: one primaryColumn, any associatedColumn
+        primaryColumn: 'Fiscal Year'
+        associatedColumn: 'FY Name'
+    calendarColumnGroup                 ← no category: its columns are time-related
+        column: IsWorkingDay</pre>
+    <ul>
+      <li>TMSL (<code>model.bim</code>) writes the same as <code>tables[].calendars[].calendarColumnGroups[]</code> of <code>{ timeUnit, primaryColumn, associatedColumns }</code>, or <code>{ columns }</code> for time-related columns.</li>
+      <li>A time-related <code>column:</code> line is three tabs deep, like a hierarchy level's, so hierarchy levels are read only inside <code>hierarchy</code> blocks.</li>
+      <li>Shown in the Tables tab (category → columns, primary first) and the export. Usage: 9.1.</li>
     </ul>
 
     <h2>4. Source detection — connector patterns</h2>
@@ -5549,14 +5805,14 @@ function renderNotes() {
         <tr><td>Web / API</td><td><code>Web.Contents / Json.Document / OData.Feed("url")</code></td><td>api</td></tr>
         <tr><td>Analysis Services / Power BI semantic model</td><td><code>AnalysisServices.Databases("powerbi://...") / PowerBI.Datasets</code> — a live/DirectQuery connection to another model</td><td>analysis-services</td></tr>
         <tr><td>PostgreSQL / MySQL</td><td><code>PostgreSQL.Database / MySQL.Database</code></td><td>other</td></tr>
-        <tr><td>Computed</td><td>No connector and no upstream table, but the query builds its own rows (<code>#table</code>, <code>Table.FromValue</code>, <code>List.Numbers/Dates/Generate</code>) — grouped as "Computed (no external source)" rather than Unknown</td><td>other</td></tr>
+        <tr><td>Computed</td><td>No connector and no upstream table, but the query builds its own rows (<code>#table</code>, <code>Table.FromValue</code>, <code>List.Dates/DateTimes/Times/Durations/Numbers/Generate</code> — including Microsoft's recommended M date table, <code>List.Dates</code> then <code>Table.FromList</code>) — grouped as "Computed (no external source)" rather than Unknown</td><td>other</td></tr>
       </tbody>
     </table>
 
     <h3>4.1 Resolution order in <code>detectSource</code></h3>
     <ol>
       <li><strong>Shared expression reference</strong> — if M contains <code>#"ExprName"</code> or a bareword expression name, route to the expression's underlying source (not to the expression itself).</li>
-      <li><strong>Inline data</strong> — <code>Table.FromRecords</code>, <code>Table.FromRows</code>, or <code>Table.FromList</code> → "Inline Data" virtual source.</li>
+      <li><strong>Inline data</strong> — <code>Table.FromRecords</code>, <code>Table.FromRows</code>, or <code>Table.FromList</code> over a list typed into the query → "Inline Data" virtual source. <code>Table.FromList</code> over a list the query generates (<code>List.Dates</code> …) is Computed instead, after any connector the query also names.</li>
       <li><strong>Direct connector</strong> — match against the patterns above.</li>
       <li><strong>Another table reference</strong> — if M references another model table (<code>Source = #"OtherTable"</code>), recursively resolve to that table's ultimate source. Cycle detection via <code>visited</code> set.</li>
       <li><strong>Fallback</strong> → "Unknown".</li>
@@ -5683,6 +5939,7 @@ function renderNotes() {
       <li><strong>System tables</strong> auto-filtered: names matching <code>LocalDateTable[_-]</code> or <code>DateTableTemplate</code></li>
       <li><strong>Manually hidden tables</strong>: <code>isHidden</code> at table level (1-tab indent boolean flag)</li>
       <li>Header toggle "Show N hidden" appears only when hidden tables exist; off by default so counts match Power BI Desktop's Fields pane</li>
+      <li>Sources follow their tables: a source whose tables are all hidden (the Auto Date Tables group) drops out of the Sources tab, its badge and the Overview's count alike, and out of the export unless it includes hidden tables</li>
       <li>When shown, hidden tables get a small gray "hidden" pill next to the name</li>
     </ul>
 
@@ -5700,13 +5957,16 @@ function renderNotes() {
         <tr><td>Direct <code>{Entity, Property}</code> pair</td><td>rare but legal; caught for completeness</td><td>Direct</td></tr>
         <tr><td>Name in Select clauses</td><td><code>{ Column: {...}, Name: "Sales.Profit" }</code> — the <code>Name</code> string is parsed as a queryRef too</td><td>Direct</td></tr>
         <tr><td>Filters, sort, conditional formatting, drillthrough, etc.</td><td>all use the structured Column/Measure pattern above and are caught by the recursive walker, including when nested inside stringified JSON in <code>config</code> / <code>filters</code> / <code>dataTransforms</code></td><td>Direct</td></tr>
-        <tr><td>DAX of a used measure or calculated column</td><td><code>Table[Col]</code>, <code>'Table'[Col]</code>, bare <code>[Measure]</code> in the DAX of any used measure <em>or used calculated column</em>. Calc-columns are DAX-defined just like measures, so their references propagate the same way. A bare <code>[Name]</code> that isn't a measure is a column in a row context — <code>[Qty] * [Price]</code> in a calculated column, <code>FILTER(Sales, [Cost] &gt; x)</code> in a measure — so it's looked up on the expression's own table and on every table the expression names; if none of them has it, every column of that name counts (safe side).</td><td>Transitive (iterative)</td></tr>
+        <tr><td>DAX of a used measure or calculated column</td><td><code>Table[Col]</code>, <code>'Table'[Col]</code>, bare <code>[Measure]</code> in the DAX of any used measure <em>or used calculated column</em>. Calc-columns are DAX-defined just like measures, so their references propagate the same way. A bare <code>[Name]</code> that isn't a measure is a column in a row context — <code>[Qty] * [Price]</code> in a calculated column, <code>FILTER(Sales, [Cost] &gt; x)</code> in a measure — so it's looked up on the expression's own table and on every table the expression names; if none of them has it, every column of that name counts (safe side). Names match in any case, as DAX matches them: <code>'Time intelligence'[Show as]</code> is the table <code>'Time Intelligence'</code> (so do report bindings and every other lookup here).</td><td>Transitive (iterative)</td></tr>
+        <tr><td>A measure's format string, KPI and detail rows</td><td>A used measure's <code>formatStringDefinition</code>, KPI <code>targetExpression</code> / <code>statusExpression</code> / <code>trendExpression</code> and <code>detailRowsDefinition</code> run whenever it does, so their references propagate with its own (FCA's <code>reservations[Currency]</code> is named only by <code>[RI Amount]</code>'s format string)</td><td>Transitive (iterative)</td></tr>
+        <tr><td>DAX naming a calendar</td><td><code>TOTALYTD([Sales], 'Fiscal')</code>, <code>DATEADD(Gregorian, -1, YEAR)</code> in used DAX — quoted or bare, any case; not a function call, a <code>VAR</code> of that name, a string or a comment — uses every column the calendar tags: the time intelligence runs on them, and removing one breaks the calendar</td><td>Transitive (iterative)</td></tr>
         <tr><td>DAX of a calculation item</td><td>Each item's expression and <code>formatStringDefinition</code>, once any column of the calculation group's table is used — an item has no field of its own and applies through the group's column. Catches e.g. a <code>LOOKUPVALUE('Dynamic Measure'[Format], …)</code> dynamic format string.</td><td>Transitive (iterative)</td></tr>
         <tr><td>M code of another used table</td><td>used table's partition M mentions another table by name <em>and</em> references a column via <code>"ColName"</code> (e.g. join keys / <code>SelectColumns</code>), <code>[ColName]</code>, or <code>#"ColName"</code>. <strong>Scalar exception:</strong> if the referenced table has exactly one column and is referenced by bare name only, the sole column is marked used (see <strong>9.3</strong>).</td><td>Transitive (iterative)</td></tr>
         <tr><td>Field parameter NAMEOF</td><td>calculated table's DAX has <code>NAMEOF('Table'[Col])</code>; when the parameter table is used in a visual, NAMEOF'd source fields are transitively used</td><td>Transitive</td></tr>
         <tr><td>Relationships</td><td><code>relationships.tmdl</code> from/to columns (TMDL quoting stripped: <code>Sales.'Order Date'</code> &rarr; <code>Order Date</code>)</td><td>Structural</td></tr>
         <tr><td>sortByColumn</td><td>column property pointing at another column (quoted names are unquoted before lookup)</td><td>Structural</td></tr>
         <tr><td><strong>Hierarchy level</strong></td><td><code>level X { column: Y }</code> inside a <code>hierarchy</code> block — the referenced column is kept alive by the hierarchy</td><td>Structural</td></tr>
+        <tr><td><strong>Calendar</strong></td><td>a column a calendar tags (3.5) — kept by the calendar until DAX names it</td><td>Structural</td></tr>
         <tr><td><strong>Row-level security</strong></td><td><code>roles/*.tmdl</code> &rarr; <code>tablePermission T = &lt;DAX&gt;</code>. The filter DAX is parsed with the same reference extractor as measure DAX; an unqualified column (<code>[Country] == "Canada"</code>, the usual way RLS filters are written) resolves to the guarded table. Counted as <em>direct</em>, not structural: a column an RLS rule filters on is load-bearing — drop it and the model stops securing rows.</td><td>Direct</td></tr>
         <tr><td><strong>Report-level measures</strong></td><td>PBIR <code>definition/reportExtensions.json</code> &rarr; <code>entities[].measures[].expression</code>; legacy <code>report.json</code> &rarr; <code>config.modelExtensions[].entities[].measures[]</code>. These measures live in the report, not the model, so their DAX is often the only reference to a model column.</td><td>Direct</td></tr>
         <tr><td><strong>Report-level filters</strong></td><td>PBIR <code>definition/report.json</code> — walked by the same recursive extractor as pages and visuals</td><td>Direct</td></tr>
@@ -5720,7 +5980,7 @@ function renderNotes() {
     <h3>9.2 Final classification</h3>
     <ul>
       <li><strong>Used</strong> — has any direct or transitive reference</li>
-      <li><strong>Structural only</strong> — only relationships / sortBy / hierarchy levels / perspective membership (kept hidden by default in the Unused tab — toggle to show)</li>
+      <li><strong>Structural only</strong> — only relationships / sortBy / hierarchy levels / calendars / perspective membership (kept hidden by default in the Unused tab — toggle to show)</li>
       <li><strong>Unused</strong> — nothing at all → flagged with a gray pill and listed in the Unused tab</li>
     </ul>
 
@@ -5756,7 +6016,7 @@ function renderNotes() {
       <li><strong>Mouse-wheel</strong> zooms (range 0.15× – 5×) and <strong>drag the canvas</strong> pans, via <code>d3-zoom</code></li>
       <li><strong>Click a node</strong> → locks focus (highlights neighbors, dims everything else). <strong>Click background</strong> to clear.</li>
       <li><strong>Hover a node</strong> → temporary focus that doesn't override a locked click selection</li>
-      <li><strong>Arrow markers</strong> show the "many → one" direction; bidirectional cross-filtering relationships render <em>dashed without arrows</em></li>
+      <li><strong>Arrow markers</strong> show the "many → one" direction; bidirectional cross-filtering relationships render <em>dashed without arrows</em>; inactive relationships (<code>isActive: false</code>, which filter nothing until a measure turns them on with <code>USERELATIONSHIP</code>) render <em>dotted and fainter</em>, and are flagged "inactive" in the lists and the export</li>
       <li><strong>SVG title elements</strong> on nodes and edges → native browser tooltips (e.g., "Sales[ProductKey] → Product[ProductKey]")</li>
       <li><strong>Hidden tables filter</strong> respected — system / <code>isHidden</code> tables excluded from both nodes and edges when toggle is off</li>
       <li><strong>Top-right controls:</strong> "Fit" (resets zoom transform to 1×, smoothly animated) and "Reset" (rebuilds the graph from scratch — useful if you've dragged things around)</li>
@@ -5807,7 +6067,7 @@ function renderNotes() {
       <li><strong>Parameters / variables</strong> as SQL — if the SQL is built at runtime via <code>"SELECT * FROM " &amp; TableNameParam</code>, only the literal pieces are extracted.</li>
       <li><strong>RLS / row-level security roles</strong> — not surfaced.</li>
       <li><strong>Translations / cultures</strong> — present in TMDL but not displayed.</li>
-      <li><strong>Detail rows expressions</strong>, <strong>KPI goals</strong>, <strong>perspectives</strong> — not surfaced.</li>
+      <li><strong>Perspectives</strong> — used for usage analysis, not displayed.</li>
       <li><strong>A live connection is paired by name.</strong> A model folder with the name the connection gives is taken to be the connected model; the connection's workspace and semantic model ID can't be checked against a folder, so a same-named copy (say, a dev model) would be paired too. The Overview says when a report was paired this way.</li>
       <li><strong>Bookmarks</strong> — a cell is what applying the bookmark does, read from the file; "—" means it leaves the visual in whatever state it's in, which PBIP can't tell you (it depends on what was clicked before). Filter state a bookmark captures is used for field references but not shown. <strong>Themes</strong> aren't parsed.</li>
     </ul>
@@ -6410,6 +6670,12 @@ function pillFor(key) {
 function rowClassFor(key) {
   return usageStatus(key) === 'unused' ? 'row-unused' : '';
 }
+/* A measure's other DAX, under its expression and labelled: format string, KPI, detail rows. */
+function measureExtrasHtml(m, filter) {
+  return measureExtraDax(m).map(x => `
+    <div class="measure-extra-label">${x.label}</div>
+    <pre class="measure-dax">${highlight(x.dax, filter)}</pre>`).join('');
+}
 function measureItemClassFor(key) {
   const s = usageStatus(key);
   if (s === 'unused') return 'is-unused';
@@ -6483,6 +6749,10 @@ function buildMarkdownExport(o) {
   for (const src of s.sources) for (const tn of src.queries) tableToSource[tn] = src;
 
   const tables = o.includeHidden ? s.tables : visibleTables();
+  // Sources follow the tables: one whose tables are all left out (auto date tables) is left out too.
+  const exported = new Set(tables.map(t => t.name));
+  const sources = s.sources.map(src => ({ ...src, queries: src.queries.filter(q => exported.has(q)) }))
+    .filter(src => src.queries.length || (src.expressions && src.expressions.length));
 
   if (o.aiPreamble && s.reportOnly) {
     push('> **Context for an AI assistant:** Below is an export of a Power BI report generated by PBIP'
@@ -6526,7 +6796,7 @@ function buildMarkdownExport(o) {
     push(`| Measures | ${countAllMeasures()} |`);
     push(`| Columns | ${countAllColumns()} |`);
     push(`| Relationships | ${s.relationships.length} |`);
-    push(`| Data sources | ${s.sources.length} |`);
+    push(`| Data sources | ${sources.length} |`);
     push(`| Report pages | ${s.pages.length} (${s.pages.reduce((a, p) => a + p.visuals.length, 0)} visuals) |`);
     push('');
     const ann = s.modelAnnotations || {};
@@ -6538,9 +6808,9 @@ function buildMarkdownExport(o) {
   }
 
   // ── Data sources ──
-  if (o.sources && s.sources.length) {
+  if (o.sources && sources.length) {
     push('## Data sources', '');
-    for (const src of s.sources) {
+    for (const src of sources) {
       push(`### ${src.name} \`${src.type}\``, '');
       if (src.server) push(`- **Server:** ${src.server}`);
       if (src.queries.length) push(`- **Tables (${src.queries.length}):** ${src.queries.join(', ')}`);
@@ -6567,6 +6837,10 @@ function buildMarkdownExport(o) {
       if (src) push(`- **Source:** ${src.name} (${src.type})`);
       if (t.description) push(`- **Description:** ${mdCell(t.description)}`);
       if (t.hierarchies && t.hierarchies.length) push(`- **Hierarchies:** ${t.hierarchies.join(', ')}`);
+      for (const cal of (t.calendars || [])) {
+        const groups = cal.groups.map(g => `${calendarUnitLabel(g.unit)}: ${[g.primary, ...g.associated, ...g.columns].filter(Boolean).join(', ')}`);
+        push(`- **Calendar ${cal.name}:** ${groups.join('; ')}`);
+      }
       push('');
       if (t.columns.length) {
         push(`**Columns (${t.columns.length})**`, '');
@@ -6606,6 +6880,7 @@ function buildMarkdownExport(o) {
           push(`#### ${m.name}${folder}`);
           if (m.formatString) push(`Format: \`${m.formatString}\``);
           push('```dax', String(m.dax || '').trim(), '```', '');
+          for (const x of measureExtraDax(m)) push(`_${x.label}:_`, '```dax', x.dax.trim(), '```', '');
         }
       }
     }
@@ -6645,10 +6920,10 @@ function buildMarkdownExport(o) {
   // ── Relationships ──
   if (o.relationships && s.relationships.length) {
     push('## Relationships', '');
-    push('| From | To | Cross-filter |', '|---|---|---|');
+    push('| From | To | Cross-filter | Active |', '|---|---|---|---|');
     for (const r of s.relationships) {
       const xf = r.crossFiltering === 'bothDirections' ? 'both' : 'single';
-      push(`| ${mdCell(`${r.fromTable}[${r.fromColumn}]`)} | ${mdCell(`${r.toTable}[${r.toColumn}]`)} | ${xf} |`);
+      push(`| ${mdCell(`${r.fromTable}[${r.fromColumn}]`)} | ${mdCell(`${r.toTable}[${r.toColumn}]`)} | ${xf} | ${r.isActive === false ? 'no' : 'yes'} |`);
     }
     push('');
   }
