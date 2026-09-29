@@ -26,6 +26,11 @@ async function main() {
     console.error('Usage: node lineage/extract.js <PBIP folder> [--out <dir>]');
     process.exit(2);
   }
+  if (!fs.existsSync(args.folder)) {
+    console.error(`No such folder: ${args.folder}`);
+    console.error('Copy the path from File Explorer: Shift+right-click the folder → Copy as path.');
+    process.exit(1);
+  }
   const files = readProjectFolder(args.folder);
   const apps = await loadModels(files);
   if (!apps.length) {
