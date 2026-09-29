@@ -2500,7 +2500,7 @@ function detectSource(mCode, expressions, tablesList, visited) {
   let viaUnknown = null;
   for (const ename of Object.keys(expressions)) {
     if (mRefersTo(scan, ename)) {
-      const info = fromM(inlineMParameters(expressions[ename].sourceM, expressions));
+      const info = fromM(inlineMParameters(expressions[ename].sourceM, expressions, tablesList));
       info.viaExpression = ename;
       // Only let the expression win if it actually resolved. A shared expression that
       // fromM can't recognise shouldn't pre-empt a connector this query names directly.
@@ -2518,7 +2518,7 @@ function detectSource(mCode, expressions, tablesList, visited) {
   }
 
   // 3. Direct connector (Snowflake, SQL, Dataverse, etc.)
-  const direct = fromM(inlineMParameters(mCode, expressions));
+  const direct = fromM(inlineMParameters(mCode, expressions, tablesList));
   if (direct.key !== 'unknown') return direct;
 
   // 4. References another model TABLE? Recursively resolve to that table's ultimate source
@@ -2544,10 +2544,21 @@ function detectSource(mCode, expressions, tablesList, visited) {
   return viaUnknown || { key: 'unknown', name: 'Unknown', type: 'other', server: '' };
 }
 
+/* Where a table's data comes from, as its source card and the Tables tab give it: a group of its
+   own for DAX-defined, generated and parameter tables, otherwise what its query says. */
+function tableSource(t, expressions, tables) {
+  const kind = tableKind(t);
+  if (kind === 'calculated') return { key: 'calc:calculated', name: 'Calculated Tables', type: 'other', server: 'DAX-defined' };
+  if (kind === 'calc-group') return { key: 'calc:group', name: 'Calculation Groups', type: 'other', server: 'DAX-defined' };
+  if (kind === 'auto-date' || kind === 'date-template') return { key: 'auto-date', name: 'Auto Date Tables', type: 'other', server: 'Power BI generated' };
+  if (isParameterTable(t)) return { key: 'parameters', name: 'Loaded Parameters', type: 'other', server: 'Parameters with Enable load' };
+  return detectSource(t.partitionSource, expressions, tables);
+}
+
 /* Collapse different expressions/tables that share the same underlying connection into one card. */
 function sourceGroupKey(info) {
   if (!info) return 'unknown';
-  const passthrough = ['calc:calculated', 'calc:group', 'auto-date', 'inline', 'computed', 'unknown'];
+  const passthrough = ['calc:calculated', 'calc:group', 'auto-date', 'parameters', 'inline', 'computed', 'unknown'];
   if (passthrough.includes(info.key)) return info.key;
   let host = info.server || '';
   const slash = host.indexOf(' / ');
@@ -2561,6 +2572,7 @@ function sourceGroupName(info) {
   if (info.key === 'calc:calculated') return 'Calculated Tables';
   if (info.key === 'calc:group') return 'Calculation Groups';
   if (info.key === 'auto-date') return 'Auto Date Tables';
+  if (info.key === 'parameters') return 'Loaded Parameters';
   if (info.key === 'inline') return 'Inline Data';
   if (info.key === 'computed') return 'Computed (no external source)';
   if (info.key === 'unknown') return 'Unknown';
@@ -2646,6 +2658,12 @@ function isParameterQuery(sourceM) {
   return parameterLiteral(sourceM) !== null
     || /\bmeta\s*\[[^\]]*\bIsParameterQuery\s*=\s*true\b[^\]]*\]\s*$/.test(String(sourceM || ''));
 }
+/* A parameter with Enable load: a Power Query table whose query is the parameter (FHSQLMonitor's
+   Server name table holds `"localhost" meta [IsParameterQuery=true, …]`). Queries name it as they
+   would any parameter — Sql.Databases(#"Server name") — so it's inlined and listed like one. */
+function isParameterTable(t) {
+  return !!t && tableKind(t) === 'm' && isParameterQuery(t.partitionSource);
+}
 /* A parameter's value and the fields of its meta record, both as M text:
    `"DEV" meta [IsParameterQuery=true, List={"DEV", "QUAL"}, Type="Text"]` gives the value "DEV"
    (quotes kept) and { IsParameterQuery: 'true', List: '{"DEV", "QUAL"}', Type: '"Text"' }. */
@@ -2681,10 +2699,11 @@ function mRefersTo(scan, name) {
   return /^[\p{L}_][\p{L}\p{N}\p{M}\p{Pc}.]*$/u.test(name)
     && new RegExp(`(?<![\\p{L}\\p{N}\\p{M}\\p{Pc}.\\[])${escRe(name)}(?![\\p{L}\\p{N}\\p{M}\\p{Pc}.])`, 'u').test(scan.bare);
 }
-/* The model's parameters for the Sources tab, in expressions.tmdl order: value, type and suggested
-   values (as M), /// description, the shared queries that name the parameter, and the Power Query
-   tables that use it — directly, or through any chain of queries that do. A table's query can be
-   referenced by the table's name, so tables are followed as well as shared queries. */
+/* The model's parameters for the Sources tab, in expressions.tmdl order and then those loaded as
+   tables (isParameterTable, `loaded`): value, type and suggested values (as M), /// description,
+   the shared queries that name the parameter, and the Power Query tables that use it — directly,
+   or through any chain of queries that do. A table's query can be referenced by the table's name,
+   so tables are followed as well as shared queries. */
 function modelParameters(expressions, tables) {
   const exprs = expressions || {};
   const shared = new Set(Object.keys(exprs));
@@ -2696,25 +2715,37 @@ function modelParameters(expressions, tables) {
     if (!usersOf.has(x)) usersOf.set(x, [...scans].filter(([n, sc]) => n !== x && mRefersTo(sc, x)).map(([n]) => n));
     return usersOf.get(x);
   };
-  return Object.keys(exprs).filter(n => isParameterQuery(exprs[n].sourceM)).map(n => {
+  const params = [
+    ...Object.keys(exprs).filter(n => isParameterQuery(exprs[n].sourceM))
+      .map(n => ({ name: n, m: exprs[n].sourceM, description: exprs[n].description || '', loaded: false })),
+    ...mTables.filter(t => !shared.has(t.name) && isParameterTable(t))
+      .map(t => ({ name: t.name, m: t.partitionSource, description: t.description || '', loaded: true })),
+  ];
+  return params.map(({ name: n, m, description, loaded }) => {
     const reached = new Set([n]), queue = [n];
     while (queue.length) for (const u of users(queue.shift())) if (!reached.has(u)) { reached.add(u); queue.push(u); }
-    const { value, fields } = parameterParts(exprs[n].sourceM);
+    const { value, fields } = parameterParts(m);
     return {
-      name: n, description: exprs[n].description || '', value,
+      name: n, description, loaded, value,
       type: fields.Type ? formatMValue(fields.Type) : '', list: fields.List || '',
       queries: users(n).filter(q => shared.has(q) && !isParameterQuery(exprs[q].sourceM)),
-      tables: mTables.filter(t => reached.has(t.name)).map(t => t.name),
+      tables: mTables.filter(t => t.name !== n && reached.has(t.name)).map(t => t.name),
     };
   });
 }
 
-function inlineMParameters(mCode, expressions) {
+function inlineMParameters(mCode, expressions, tables) {
   if (!mCode || !expressions) return mCode || '';
   const params = {};
   for (const [name, data] of Object.entries(expressions)) {
     const lit = parameterLiteral(data && data.sourceM);
     if (lit !== null) params[name] = lit;
+  }
+  // Parameters loaded as tables (isParameterTable) go in the same way.
+  for (const t of (tables || [])) {
+    if (params[t.name] !== undefined || tableKind(t) !== 'm') continue;
+    const lit = parameterLiteral(t.partitionSource);
+    if (lit !== null) params[t.name] = lit;
   }
   if (!Object.keys(params).length) return mCode;
   let out = mCode;
@@ -4188,7 +4219,7 @@ async function loadProject(byPath, project) {
     // RangeEnd alone still made that card, and finops-toolkit's storage model listed six
     // parameters among its Unknown queries.
     if (isParameterQuery(edata.sourceM)) continue;
-    const info = fromM(inlineMParameters(edata.sourceM, App.state.expressions));
+    const info = fromM(inlineMParameters(edata.sourceM, App.state.expressions, tables));
     const key = sourceGroupKey(info);
     const src = ensureSource(info, key);
     src.expressions.push({ name: ename, description: edata.description, m: edata.sourceM });
@@ -4196,17 +4227,7 @@ async function loadProject(byPath, project) {
 
   // Group tables
   for (const t of tables) {
-    let info;
-    const kind = tableKind(t);
-    if (kind === 'calculated') {
-      info = { key: 'calc:calculated', name: 'Calculated Tables', type: 'other', server: 'DAX-defined' };
-    } else if (kind === 'calc-group') {
-      info = { key: 'calc:group', name: 'Calculation Groups', type: 'other', server: 'DAX-defined' };
-    } else if (kind === 'auto-date' || kind === 'date-template') {
-      info = { key: 'auto-date', name: 'Auto Date Tables', type: 'other', server: 'Power BI generated' };
-    } else {
-      info = detectSource(t.partitionSource, App.state.expressions, tables);
-    }
+    const info = tableSource(t, App.state.expressions, tables);
     const key = sourceGroupKey(info);
     const src = ensureSource(info, key);
     src.queries.push(t.name);
@@ -4548,7 +4569,7 @@ function parametersHtml() {
           const more = shownTables.slice(12);
           return `
           <tr>
-            <td style="font-weight:600">${esc(p.name)}${p.description ? `<div style="font-family:var(--sans);font-weight:400;color:var(--text-2);margin-top:3px">${esc(p.description)}</div>` : ''}</td>
+            <td style="font-weight:600">${esc(p.name)}${p.loaded ? '<div class="flag" style="font-weight:400;margin-top:3px">loaded as a table</div>' : ''}${p.description ? `<div style="font-family:var(--sans);font-weight:400;color:var(--text-2);margin-top:3px">${esc(p.description)}</div>` : ''}</td>
             <td>${p.type ? `<span class="data-type ${typeClass[p.type] || ''}">${esc(p.type)}</span>` : ''}</td>
             <td style="overflow-wrap:anywhere">${shown(p.value)}${p.list ? `<div class="flag" style="margin-top:3px">${suggested(p.list)}</div>` : ''}</td>
             <td>
@@ -4721,10 +4742,7 @@ function renderTableDetail() {
 
   // Find which source this table belongs to
   const kind = tableKind(t);
-  const srcInfo = (kind === 'calculated') ? { type: 'other', name: 'Calculated Tables' }
-                : (kind === 'calc-group') ? { type: 'other', name: 'Calculation Groups' }
-                : (kind === 'auto-date' || kind === 'date-template') ? { type: 'other', name: 'Auto Date Tables' }
-                : detectSource(t.partitionSource, App.state.expressions, App.state.tables);
+  const srcInfo = tableSource(t, App.state.expressions, App.state.tables);
   const rels = App.state.relationships.filter(r => r.fromTable === t.name || r.toTable === t.name);
   const rls = roleFiltersOn(t.name), persps = perspectivesWith(t.name);
   const measByFolder = {};
@@ -6036,12 +6054,13 @@ function renderNotes() {
     <ul>
       <li><strong>SQL / Snowflake / Oracle / SharePoint / Excel / API:</strong> group key is <code>type:host</code> (database/warehouse suffix dropped, lowercased).</li>
       <li><strong>Dataverse:</strong> group key is <code>dataverse:&lt;url&gt;</code> — different environments stay distinct.</li>
-      <li><strong>Virtual sources</strong> (Calculated Tables, Calculation Groups, Auto Date Tables, Inline Data, Unknown) — kept as their own groups.</li>
+      <li><strong>Virtual sources</strong> (Calculated Tables, Calculation Groups, Auto Date Tables, Loaded Parameters, Inline Data, Unknown) — kept as their own groups.</li>
     </ul>
 
     <h3>4.3 Parameters</h3>
     <ul>
       <li><strong>What counts:</strong> a shared expression whose value carries a <code>meta [IsParameterQuery=true, …]</code> record, whatever the type: text, number, date/time, logical or <code>null</code> (incremental refresh's <code>RangeStart</code> / <code>RangeEnd</code>). A bare string literal counts too. A parameter is an input to queries, not a source, so it gets no source card; text values are substituted into connector calls (<code>Sql.Database(Server, …)</code>) before detection.</li>
+      <li><strong>Loaded as a table</strong> — a parameter with <em>Enable load</em> is a Power Query table whose query is the parameter. Its value is substituted the same way, and it's listed with the others, marked as loaded. The tables themselves go on a <em>Loaded Parameters</em> card. FHSQLMonitor's <code>Server name</code>, <code>Database name</code> and <code>Schema name</code> are such tables; before they were substituted, its tables reading <code>Sql.Databases(#"Server name")</code> showed as Unknown, or as Inline Data by way of its <code>Data load</code> config table, rather than SQL Server <code>localhost</code>.</li>
       <li><strong>The list</strong> below the source cards gives each one's type, value (<code>#datetime(…)</code> shown as a date), the values it suggests (<code>List={…}</code>, or a query's name), its <code>///</code> description, and what uses it. The export has the same as a Parameters section after Data sources, with a count in its summary.</li>
       <li><strong>Used by</strong> — a query uses a name it writes as <code>#"Name"</code>, or bare if the name is a plain identifier: not inside a string, a comment or another <code>#"…"</code>, not a <code>[Name]</code> field, and not when a step of the query's own <code>let</code> has that name. Uses are followed through shared queries and through tables' queries, which others can reference by the table's name. FHSQLMonitor's <code>Data load list</code> reaches 113 of its 128 Power Query tables that way (its <code>Data load</code> table reads it, and 111 tables read <code>#"Data load"</code>), so past 12 chips the rest fold away. Tables hidden from view are counted, not listed.</li>
     </ul>
@@ -6285,7 +6304,6 @@ function renderNotes() {
     <ul>
       <li><strong>Function definitions in M</strong> (<code>let f = (x) => ...</code>) — not traced as a source. A table that calls a custom function won't be classified.</li>
       <li><strong>Parameters / variables</strong> as SQL — if the SQL is built at runtime via <code>"SELECT * FROM " &amp; TableNameParam</code>, only the literal pieces are extracted.</li>
-      <li><strong>A parameter loaded as a table</strong> (a parameter with <em>Enable load</em> is a table whose query is the parameter) isn't substituted into connector calls, nor listed with the parameters. FHSQLMonitor's <code>Server name</code>, <code>Database name</code> and <code>Schema name</code> are such tables, so a query reading only <code>Sql.Databases(#"Server name")</code> shows as Unknown rather than SQL Server <code>localhost</code>.</li>
       <li><strong>Object-level security</strong> (a role's <code>metadataPermission</code> / <code>columnPermission</code>) isn't read, and a role's members aren't shown — only its model permission and row filters.</li>
       <li><strong>Translations / cultures</strong> — present in TMDL but not displayed.</li>
       <li><strong>A live connection is paired by name.</strong> A model folder with the name the connection gives is taken to be the connected model; the connection's workspace and semantic model ID can't be checked against a folder, so a same-named copy (say, a dev model) would be paired too. The Overview says when a report was paired this way.</li>
@@ -7086,6 +7104,7 @@ function buildMarkdownExport(o) {
       push(`### ${p.name}`, '');
       if (p.description) push(p.description, '');
       if (p.type) push(`- **Type:** ${p.type}`);
+      if (p.loaded) push('- **Loaded as a table:** yes (Enable load)');
       push(`- **Value:** \`${value(p.value)}\``);
       if (p.list) push(`- **Suggested values:** ${p.list.startsWith('{')
         ? splitTopLevel(p.list.slice(1, -1), ',').map(value).join(', ') : `from the query ${stripIdQuotes(p.list)}`}`);

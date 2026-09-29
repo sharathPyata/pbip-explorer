@@ -16,7 +16,7 @@ const model = (expressions, tables) => ({
   ...Object.fromEntries(tables.map(([name, m, extra], i) => [`P.SemanticModel/definition/tables/T${i}.tmdl`, table(name, m, extra)])),
 });
 async function load(files) {
-  const app = loadApp(['App', 'processFiles', 'renderSources', 'modelParameters', 'buildMarkdownExport', 'applyExportPreset'], { dom: true });
+  const app = loadApp(['App', 'processFiles', 'renderSources', 'modelParameters', 'buildMarkdownExport', 'applyExportPreset', 'renderTableDetail'], { dom: true });
   await app.processFiles(fileList(files));
   return app;
 }
@@ -103,6 +103,56 @@ test('the export: a Parameters section after Data sources, its own toggle, and a
   const presets = ['schema', 'measures', 'everything'].map(name => { app.applyExportPreset(name); return o.parameters; });
   eq(presets, [false, false, true], 'schema, measures, everything presets');
 });
+
+// FHSQLMonitor: its server, database and schema are parameters with Enable load — tables whose
+// query is the parameter — and every data table reads Sql.Databases(#"Server name").
+const SERVER = '"localhost" meta [IsParameterQuery=true, Type="Text", IsParameterQueryRequired=true]';
+const DATABASE = '"FHSQLMonitor" meta [IsParameterQuery=true, Type="Text", IsParameterQueryRequired=true]';
+const readTable = item => ['let', '    dbList = Sql.Databases(#"Server name"),', '    db = dbList{[Name = #"Database name"]}[Data],',
+  `    table = db{[Schema = "FHSM", Item = "${item}"]}[Data]`, 'in', '    table'];
+const DATA_LOAD = ['let', '    Source = Table.FromRows({{"Waits", "Yes"}}, {"Service", "DataLoad"})', 'in', '    Source'];
+const WAITS = ['let', '    load = Table.First(Table.SelectRows(#"Data load", each [Service] = "Waits")),',
+  '    dbList = Sql.Databases(#"Server name"),', '    db = dbList{[Name = #"Database name"]}[Data],',
+  '    table = db{[Schema = "FHSM", Item = "Waits"]}[Data]', 'in', '    table'];
+const loadedTmdl = {
+  'P.SemanticModel/definition/model.tmdl': 'model Model\n\tculture: en-US\n',
+  'P.SemanticModel/definition/tables/Server name.tmdl': ['/// The SQL Server instance to read', "table 'Server name'",
+    "\tcolumn 'Server name'", '\t\tdataType: string', "\t\tsourceColumn: Server name", "\tpartition 'Server name' = m", '\t\tmode: import', `\t\tsource = ${SERVER}`].join('\n'),
+  'P.SemanticModel/definition/tables/Database name.tmdl': ["table 'Database name'",
+    "\tcolumn 'Database name'", '\t\tdataType: string', "\t\tsourceColumn: Database name", "\tpartition 'Database name' = m", '\t\tmode: import', `\t\tsource = ${DATABASE}`].join('\n'),
+  'P.SemanticModel/definition/tables/Date.tmdl': table('Date', readTable('Date')),
+  'P.SemanticModel/definition/tables/Data load.tmdl': table('Data load', DATA_LOAD),
+  'P.SemanticModel/definition/tables/Waits.tmdl': table('Waits', WAITS),
+};
+const bimTable = (name, expression, description) => ({ name, ...(description ? { description } : {}),
+  columns: [{ name: 'Id', dataType: 'int64', sourceColumn: 'Id' }], partitions: [{ name, mode: 'import', source: { type: 'm', expression } }] });
+const loadedTmsl = { 'P.SemanticModel/model.bim': { compatibilityLevel: 1601, model: { tables: [
+  bimTable('Server name', SERVER, 'The SQL Server instance to read'), bimTable('Database name', DATABASE),
+  bimTable('Date', readTable('Date')), bimTable('Data load', DATA_LOAD), bimTable('Waits', WAITS)] } } };
+
+for (const [format, files] of [['TMDL', loadedTmdl], ['TMSL', loadedTmsl]]) {
+  test(`${format}: a parameter loaded as a table feeds connectors, has a card of its own, and is listed`, async () => {
+    const app = await load(files);
+    const s = app.App.state;
+    eq(s.sources.map(src => [src.name, src.type, [...src.queries].sort()]), [
+      ['Inline Data', 'other', ['Data load']],
+      ['Loaded Parameters', 'other', ['Database name', 'Server name']],
+      ['localhost', 'sql-server', ['Date', 'Waits']],   // Waits reads Data load's rows too, but its data is SQL's
+    ], 'sources');
+    eq(app.modelParameters(s.expressions, s.tables).map(p => [p.name, p.loaded, p.type, p.value, p.tables, p.description]), [
+      ['Database name', true, 'Text', '"FHSQLMonitor"', ['Date', 'Waits'], ''],
+      ['Server name', true, 'Text', '"localhost"', ['Date', 'Waits'], 'The SQL Server instance to read'],
+    ], 'parameters');
+    app.renderSources();
+    has(app.App.els.sourcesContent.innerHTML, '<td style="font-weight:600">Server name<div class="flag" style="font-weight:400;margin-top:3px">loaded as a table</div>');
+    has(app.buildMarkdownExport(s.exportOpts), '### Server name\n\nThe SQL Server instance to read\n\n- **Type:** Text\n- **Loaded as a table:** yes (Enable load)\n- **Value:** `localhost`\n- **Tables (2):** Date, Waits\n');
+    const detail = app.element();
+    app.document.getElementById = id => (id === 'tableDetail' ? detail : null);
+    s.activeTable = 'Server name';
+    app.renderTableDetail();
+    has(detail.innerHTML, '<span class="source-type-badge other">other</span> <span style="font-family:var(--mono);color:var(--text-2)">Loaded Parameters</span>');
+  });
+}
 
 test("names, values and descriptions render as text; past 12 tables a parameter's chips fold away", async () => {
   const tables = Array.from({ length: 14 }, (_, i) => [`T${String(i + 1).padStart(2, '0')}`, ['let', '    Source = Sql.Database(#"<b>Server</b>", "db")', 'in', '    Source']]);
