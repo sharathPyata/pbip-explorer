@@ -2131,11 +2131,13 @@ function visibleTables() {
 }
 
 /* expressions.tmdl — shared Power Query queries and parameters: `expression Name = <M>`, the M on
-   that line and on the lines below it, two tabs in. The expression's own properties (lineageTag:,
-   queryGroup:, annotation …) are one tab in, so the M ends at the first line indented less than
-   two tabs; reading on to the next unindented line took them in too, and the Sources tab and the
-   export showed FCA's DatabaseQuery ending in its lineageTag and annotation. A /// block right
-   above the declaration is its description. */
+   that line, in a ``` fence, or on the lines below it, two tabs in. The expression's own
+   properties (lineageTag:, queryGroup:, annotation …) are one tab in, so an indented body ends at
+   the first line indented less than two tabs; reading on to the next unindented line took them in
+   too, and the Sources tab and the export showed FCA's DatabaseQuery ending in its lineageTag and
+   annotation. The fence and the indent are TMDL's, not M, so they're dropped as they are from a
+   partition's source: finops-toolkit's fenced expressions kept their ``` lines, and the first one
+   closed the export's ```m block. A /// block right above the declaration is its description. */
 function parseExpressions(text) {
   if (!text) return {};
   const result = {};
@@ -2152,18 +2154,25 @@ function parseExpressions(text) {
     const m = lines[i].match(/^expression\s+(.+?)\s*=\s*(.*)$/);
     if (!m) { i++; continue; }
     const ename = unquote(m[1]);
-    const restFirst = m[2];
+    let first = m[2].trim();
     i++;
-    const mLines = restFirst.trim() ? [restFirst] : [];
-    while (i < lines.length && (!lines[i].trim() || /^\t\t/.test(lines[i]))) {
-      mLines.push(lines[i]);
-      i++;
+    const body = [];
+    if (first.startsWith('```') && first.indexOf('```', 3) > 0) {   // ```M``` on one line
+      first = first.slice(3, first.indexOf('```', 3));
+    } else if (first.startsWith('```')) {                          // fenced, up to the closing ```
+      first = first.slice(3);
+      for (; i < lines.length; i++) {
+        if (lines[i].includes('```')) { const before = lines[i].split('```')[0]; if (before.trim()) body.push(before); i++; break; }
+        body.push(lines[i]);
+      }
+    } else {                                                        // on the line, and/or two tabs in below it
+      while (i < lines.length && (!lines[i].trim() || /^\t\t/.test(lines[i]))) body.push(lines[i++]);
     }
     // Then its properties, up to the next unindented line — a /// block or the next expression.
     while (i < lines.length && /^(?:[\t ]|$)/.test(lines[i])) i++;
     result[ename] = {
       description: comments.join(' '),
-      sourceM: mLines.join('\n').trimEnd(),
+      sourceM: `${first}\n${normalizeIndent(body.join('\n'))}`.trim(),
     };
   }
   return result;
