@@ -24,3 +24,6 @@ My new report*.json
 # Build artifacts (none today, future-proof)
 dist/
 node_modules/
+
+# Measure lineage output (lineage/extract.js)
+lineage-output/
