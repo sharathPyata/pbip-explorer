@@ -827,6 +827,31 @@ tr.row-unused td:first-child { font-style: italic; }
   color: var(--text-3);
   margin-top: 4px;
 }
+.measure-head-right { display: flex; align-items: baseline; gap: 10px; }
+.measure-head.has-usage { cursor: pointer; }
+.usage-toggle {
+  font: inherit; font-size: 11px; color: var(--text-2); white-space: nowrap;
+  background: var(--bg-3); border: 1px solid var(--border); border-radius: 10px;
+  padding: 1px 9px; cursor: pointer;
+}
+.usage-toggle:hover, .measure-head.has-usage:hover .usage-toggle { border-color: var(--green-accent); color: var(--text); }
+.usage-panel {
+  margin: 2px 0 10px; padding: 8px 12px; font-size: 12px; line-height: 1.45;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+}
+.usage-sec + .usage-sec { margin-top: 8px; }
+.usage-sec-title {
+  font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--text-2); margin-bottom: 3px;
+}
+.usage-count { font-family: var(--mono); color: var(--text-3); font-weight: 600; }
+.usage-sec ul { margin: 0; padding-left: 16px; }
+.usage-sec li { margin: 2px 0; }
+.usage-page { color: var(--accent); font-weight: 600; }
+a.usage-page { cursor: pointer; }
+a.usage-page:hover { text-decoration: underline; }
+.usage-detail { color: var(--text-3); font-family: var(--mono); font-size: 11px; }
+.usage-none { color: var(--text-3); }
 
 /* ── Measures view ── */
 .measures-toolbar {
@@ -1231,6 +1256,7 @@ const App = {
     pagesSearch: '',
     activeNode: null,
     measureFilter: '',
+    usageOpen: new Set(), // Measures tab: keys of the measures whose usage panel is open
     searchTerm: '',
     showHidden: false,    // include hidden / LocalDateTable_* / DateTableTemplate* in displays?
     exportOpts: {         // which sections the Export (Markdown) tab includes
@@ -3004,14 +3030,22 @@ async function parsePbirReport(byPath, pagesRoot) {
   // pagesRoot: ".../<Project>.Report/definition/pages" (the folder, not a specific file —
   // pages.json is OPTIONAL per the PBIR spec, so we don't depend on it existing).
   const pagesJsonKey = `${pagesRoot}/pages.json`;
-  const allJson = [];  // every parsed JSON file — each fed individually to extractAllReportReferences
+  // Every parsed JSON file goes through the report-references walker on its own. Do NOT concatenate
+  // the file texts — several JSON documents joined together aren't valid JSON, so one JSON.parse
+  // would fail and silently return no references, flagging fields used only in filters, sort or
+  // conditional formatting as unused. Each file's references are also placed — a visual's filters,
+  // formatting, sort and other settings; a page's or the report's filters and settings; a bookmark
+  // — for the Measures tab's usage panel (sites; see buildUsageIndex step 8).
+  const references = new Set(), fieldRefs = new Set(), sites = [];
+  const walk = (obj) => { const r = extractAllReportReferences(obj, fieldRefs); for (const x of r) references.add(x); return r; };
+  const site = (section, place, refs) => { if (refs.size) sites.push({ section, ...place, refs: [...refs] }); };
 
   // 1. Page order from pages.json (when present — optional)
   let pagesJson = {};
   try {
     const t = await byPath[pagesJsonKey].text();
     pagesJson = JSON.parse(t);
-    allJson.push(pagesJson);
+    walk(pagesJson);
   } catch (e) {}
   let pageNames = Array.isArray(pagesJson.pageOrder) ? pagesJson.pageOrder.slice() : [];
 
@@ -3036,8 +3070,11 @@ async function parsePbirReport(byPath, pagesRoot) {
     let pageJson;
     try {
       pageJson = JSON.parse(await byPath[pageJsonKey].text());
-      allJson.push(pageJson);
     } catch (e) { return; }
+    const where = { page: pageJson.displayName || pageJson.name || pageName, pageName: pageJson.name || pageName };
+    const pageRefs = walk(pageJson), pageFilters = reportRefsOf(pageJson.filterConfig);
+    site('filter', { ...where, label: 'page filter', detail: '' }, pageFilters);
+    site('format', { ...where, label: 'page settings', detail: '' }, setMinus(pageRefs, pageFilters));
 
     const visualPrefix = `${pagesRoot}/${pageName}/visuals/`;
     const visualKeys = Object.keys(byPath).filter(k =>
@@ -3048,13 +3085,16 @@ async function parsePbirReport(byPath, pagesRoot) {
       if (t == null) continue;
       try {
         const vJson = JSON.parse(t);
-        allJson.push(vJson);
+        const visualRefs = walk(vJson);
         // A group container declares visualGroup instead of visual (see parseReport).
         if (vJson.visualGroup) {
           groups.push({ id: vJson.name || '', name: vJson.visualGroup.displayName || '',
             isHidden: !!vJson.isHidden, parentGroup: vJson.parentGroupName || '' });
         } else {
-          visuals.push(parsePbirVisual(vJson));
+          const v = parsePbirVisual(vJson), vis = vJson.visual || {};
+          visuals.push(v);
+          visualSites(site, { ...where, label: visualLabel(v).text || v.type }, v, visualRefs,
+            vJson.filterConfig, [vis.objects, vis.visualContainerObjects], vis.query && vis.query.sortDefinition);
         }
       } catch (e) {}
     }
@@ -3090,13 +3130,24 @@ async function parsePbirReport(byPath, pagesRoot) {
   const extraTexts = await Promise.all(extraKeys.map(k => byPath[k].text().catch(() => null)));
   const reportMeasures = [], bookmarks = [];
   let bookmarksMeta = null;
+  const pageTitle = new Map(pages.map(p => [p.name, p.displayName]));
   for (let i = 0; i < extraKeys.length; i++) {
     if (extraTexts[i] == null) continue;
     let j;
     try { j = JSON.parse(extraTexts[i]); } catch (e) { continue; }
-    allJson.push(j);
-    if (extraKeys[i].endsWith('.bookmark.json')) { const b = normaliseBookmark(j); if (b) bookmarks.push(b); }
-    else if (extraKeys[i].endsWith('/bookmarks/bookmarks.json')) bookmarksMeta = j;
+    const fileRefs = walk(j);
+    if (extraKeys[i].endsWith('.bookmark.json')) {
+      const b = normaliseBookmark(j);
+      if (b) {
+        bookmarks.push(b);
+        site('bookmark', { page: pageTitle.get(b.page) || '', pageName: b.page, label: b.name, detail: '' }, fileRefs);
+      }
+    } else if (extraKeys[i].endsWith('/bookmarks/bookmarks.json')) bookmarksMeta = j;
+    else if (extraKeys[i] === `${definitionRoot}/report.json`) {
+      const reportFilters = reportRefsOf(j.filterConfig);
+      site('filter', { page: '', pageName: '', label: 'report filter', detail: '' }, reportFilters);
+      site('format', { page: '', pageName: '', label: 'report settings', detail: '' }, setMinus(fileRefs, reportFilters));
+    }
     // Report-level measures are real measures that live in the report, not the model. Their
     // DAX is the only place some model columns are referenced, so mine it for references
     // as well as surfacing the measures themselves.
@@ -3113,16 +3164,7 @@ async function parsePbirReport(byPath, pagesRoot) {
     }
   }
 
-  // 4. Run the report-references walker on EACH parsed file and union the results.
-  //    Do NOT concatenate the file texts — multiple JSON documents joined together aren't
-  //    valid JSON, so a single JSON.parse would fail and silently return zero references
-  //    (which would falsely flag fields used only in filters / sort / conditional formatting
-  //    as "unused"). Passing each already-parsed object individually is the correct approach.
-  const references = new Set(), fieldRefs = new Set();
-  for (const obj of allJson) {
-    for (const r of extractAllReportReferences(obj, fieldRefs)) references.add(r);
-  }
-  // Report-level measure DAX references model objects by name, which the JSON walker above
+  // 4. Report-level measure DAX references model objects by name, which the JSON walker above
   // can't see — it's an expression string, not a structured binding.
   for (const rm of reportMeasures) {
     const { columns, measures } = parseDaxReferences(rm.dax, rm.table);
@@ -3143,7 +3185,30 @@ async function parsePbirReport(byPath, pagesRoot) {
   for (const b of bookmarks) if (folderOf[b.id]) b.folder = folderOf[b.id];
   const rank = (b) => { const i = order.indexOf(b.id); return i < 0 ? 1e9 : i; };
   bookmarks.sort((a, b) => rank(a) - rank(b));
-  return { pages, references, fieldRefs, reportMeasures, bookmarks };
+  return { pages, references, fieldRefs, reportMeasures, bookmarks, sites };
+}
+
+/* The references in a part of a report file — a filterConfig, a visual's formatting — as a Set of
+   "Table.Field"; none for a part that isn't there. For placing references, not counting them. */
+function reportRefsOf(part) {
+  return part == null ? new Set() : extractAllReportReferences(part);
+}
+function setMinus(a, ...others) {
+  const out = new Set(a);
+  for (const o of others) for (const x of o) out.delete(x);
+  return out;
+}
+/* A visual's references, placed: its filters, its formatting (conditional formatting, a dynamic
+   title), its sort, and whatever else in it names a field (expansion state, stale names). Its
+   bindings are left out: they come from its fields, with their roles (buildUsageIndex step 8).
+   Shared by both report formats; `place` = { page, pageName, label }. */
+function visualSites(site, place, v, allRefs, filters, formatting, sort) {
+  const bound = new Set(v.fields.map(f => parseQueryRef(f.ref)).filter(Boolean).map(r => `${r.table}.${r.field}`));
+  const f = reportRefsOf(filters), fmt = reportRefsOf(formatting), srt = reportRefsOf(sort);
+  site('filter', { ...place, detail: `${v.type} · visual filter` }, f);
+  site('format', { ...place, detail: `${v.type} · formatting` }, fmt);
+  site('visual', { ...place, detail: `${v.type} · sort` }, srt);
+  site('visual', { ...place, detail: `${v.type} · other settings` }, setMinus(allRefs, bound, f, fmt, srt));
 }
 
 /* Parse a single PBIR visual.json into the same shape parseReport's visuals use. */
@@ -3604,7 +3669,7 @@ function buildUsageIndex() {
     }
     for (const ci of (t.calcItems || [])) {
       calcItemDax.push({
-        table: t,
+        table: t, name: ci.name,
         label: `calc item [${ci.name}]`,
         refs: [parseDaxReferences(ci.dax, t.name, ix), parseDaxReferences(ci.formatStringDefinition, t.name, ix)],
       });
@@ -3726,9 +3791,9 @@ function buildUsageIndex() {
   // 7. Field parameters: calculated tables whose DAX has NAMEOF('Table'[Col]) references.
   //    If the parameter table is used in a visual, the NAMEOF'd source fields are
   //    transitively used (the user dynamically picks which one is shown at runtime).
-  for (const t of App.state.tables) {
-    if (t.partitionKind !== 'calculated' || !t.partitionSource) continue;
-    if (!tableIsUsed(t.name)) continue;
+  const nameOfRefs = (t) => {
+    const out = [];
+    if (t.partitionKind !== 'calculated' || !t.partitionSource) return out;
     // Match NAMEOF('Table'[Field]) — with or without the table prefix.
     const nameOfRe = /NAMEOF\s*\(\s*(?:'([^']+)')?\s*\[([^\]]+)\]\s*\)/gi;
     let m;
@@ -3741,11 +3806,86 @@ function buildUsageIndex() {
         const tt = App.state.tables.find(x => x.columns.some(c => c.name.toLowerCase() === lf) || x.measures.some(mm => mm.name.toLowerCase() === lf));
         if (tt) table = tt.name;
       }
-      if (!table) continue;
-      const e = entry(`${table}.${field}`);
+      if (table) out.push(`${table}.${field}`);
+    }
+    return out;
+  };
+  for (const t of App.state.tables) {
+    if (!tableIsUsed(t.name)) continue;
+    for (const ref of nameOfRefs(t)) {
+      const e = entry(ref);
       const reason = `field parameter [${t.name}]`;
       if (e && !e.direct.includes(reason) && !e.transitive.includes(reason)) e.transitive.push(reason);
     }
+  }
+
+  // 8. Where each field is used — the Measures tab's usage panel: every place that names it, by
+  //    kind. Visuals, with the roles it fills; filters, formatting and bookmarks (the report sites
+  //    the parsers placed); DAX — other measures, calculated columns, calculation items, security
+  //    roles, DAX functions, report-level measures; field parameters; perspectives. Places, not
+  //    verdicts: a reference from something nobody uses is listed too, marked unused, which is how a
+  //    dead chain shows. Nothing here changes what counts as used.
+  for (const e of Object.values(byKey)) e.uses = [];
+  const keyOf = (k) => { const e = entry(k); return e ? `${e.table}.${e.name}` : null; };
+  const addUse = (k, u) => { const e = entry(k); if (e) e.uses.push(u); };
+  for (const page of App.state.pages) {
+    for (const v of page.visuals) {
+      const roles = new Map();   // field key → the roles it fills in this visual
+      for (const f of v.fields) {
+        const r = parseQueryRef(f.ref);
+        const k = r && keyOf(`${r.table}.${r.field}`);
+        if (k) roles.set(k, [...(roles.get(k) || []), f.role]);
+      }
+      const label = visualLabel(v).text || v.type;
+      for (const [k, rs] of roles) {
+        byKey[k].uses.push({ section: 'visual', page: page.displayName, pageName: page.name, label, detail: `${v.type} · ${[...new Set(rs)].join(', ')}` });
+      }
+    }
+  }
+  for (const st of (App.state.reportSites || [])) {
+    for (const k of new Set(st.refs.map(keyOf).filter(Boolean))) {
+      byKey[k].uses.push({ section: st.section, page: st.page, pageName: st.pageName, label: st.label, detail: st.detail });
+    }
+  }
+  const daxUse = (refs, u, self) => {
+    for (const r of [...refs.columns, ...refs.measures]) if (r !== self) addUse(r, u);
+  };
+  for (const t of App.state.tables) {
+    for (const m of t.measures) {
+      const k = `${t.name}.${m.name}`;
+      daxUse(exprDax[k], { section: 'dax', label: `[${m.name}]`, detail: `measure in ${t.name}`, unused: !isUsed(k) }, k);
+    }
+    for (const c of t.columns) {
+      const k = `${t.name}.${c.name}`;
+      if (exprDax[k]) daxUse(exprDax[k], { section: 'dax', label: `${t.name}[${c.name}]`, detail: 'calculated column', unused: !isUsed(k) }, k);
+    }
+  }
+  for (const item of calcItemDax) {
+    const inUse = item.table.columns.some(c => isUsed(`${item.table.name}.${c.name}`));
+    for (const refs of item.refs) daxUse(refs, { section: 'dax', label: item.name, detail: `calculation item in ${item.table.name}`, unused: !inUse });
+  }
+  for (const role of (App.state.roles || [])) {
+    for (const tp of (role.tablePermissions || [])) {
+      daxUse(parseDaxReferences(tp.dax, tp.table, ix), { section: 'dax', label: `role ${role.name}`, detail: `security filter on ${tp.table}` });
+    }
+  }
+  for (const fn of (App.state.functions || [])) daxUse(parseDaxReferences(fn.dax, null, ix), { section: 'dax', label: `${fn.name}()`, detail: 'DAX function' });
+  for (const rm of (App.state.reportMeasures || [])) {
+    daxUse(parseDaxReferences(rm.dax, rm.table, ix), { section: 'dax', label: `[${rm.name}]`, detail: 'report-level measure' });
+  }
+  for (const t of App.state.tables) {
+    const inUse = tableIsUsed(t.name);
+    for (const ref of nameOfRefs(t)) addUse(ref, { section: 'parameter', label: t.name, detail: 'field parameter', unused: !inUse });
+  }
+  for (const persp of (App.state.perspectives || [])) {
+    for (const mem of (persp.members || [])) addUse(`${mem.table}.${mem.name}`, { section: 'perspective', label: persp.name, detail: '' });
+  }
+  for (const e of Object.values(byKey)) {
+    const seen = new Set();
+    e.uses = e.uses.filter(u => {
+      const sig = [u.section, u.page, u.label, u.detail].join('\u0000');
+      return !seen.has(sig) && seen.add(sig);
+    });
   }
 
   App.state.usage = { byKey };
@@ -4055,21 +4195,70 @@ function parseLegacyReportMeasures(reportText) {
 async function parseReportFolder(byPath, report) {
   if (report.pagesRoot) {
     const r = await parsePbirReport(byPath, report.pagesRoot);
-    return { pages: r.pages, references: r.references, fieldRefs: r.fieldRefs, reportMeasures: r.reportMeasures || [], bookmarks: r.bookmarks || [] };
+    return { pages: r.pages, references: r.references, fieldRefs: r.fieldRefs, reportMeasures: r.reportMeasures || [], bookmarks: r.bookmarks || [], sites: r.sites || [] };
   }
   if (report.legacyKey) {
     const text = await byPath[report.legacyKey].text();
     const fieldRefs = new Set();
-    const references = extractAllReportReferences(text, fieldRefs);
+    const fileRefs = extractAllReportReferences(text, fieldRefs);
+    const references = new Set(fileRefs);
     const reportMeasures = parseLegacyReportMeasures(text);
     // As for PBIR: a report measure's DAX is an expression string the JSON walker can't see into.
     for (const rm of reportMeasures) {
       const { columns, measures } = parseDaxReferences(rm.dax, rm.table);
       for (const r of [...columns, ...measures]) references.add(r);
     }
-    return { pages: parseReport(text), references, fieldRefs, reportMeasures, bookmarks: parseLegacyBookmarks(text) };
+    const pages = parseReport(text);
+    return { pages, references, fieldRefs, reportMeasures, bookmarks: parseLegacyBookmarks(text), sites: legacyReportSites(text, pages, fileRefs) };
   }
-  return { pages: [], references: new Set(), fieldRefs: new Set(), reportMeasures: [], bookmarks: [] };
+  return { pages: [], references: new Set(), fieldRefs: new Set(), reportMeasures: [], bookmarks: [], sites: [] };
+}
+
+/* Where the references in a legacy report.json sit — the places parsePbirReport records from PBIR's
+   files: each visual's filters, formatting, sort and other settings; each page's filters and
+   settings; each bookmark; the report's filters, and its settings, which also take whatever else in
+   the file names a field, so every reference that counts toward usage is placed somewhere.
+   `pages` = parseReport(text), one per section in order; `fileRefs` = the whole file's references. */
+function legacyReportSites(text, pages, fileRefs) {
+  let r;
+  try { r = JSON.parse(text); } catch (e) { return []; }
+  const parse = (v) => { if (typeof v !== 'string') return v || null; try { return JSON.parse(v); } catch (e) { return null; } };
+  const sites = [], placed = new Set();
+  const site = (section, place, refs) => {
+    if (!refs.size) return;
+    sites.push({ section, ...place, refs: [...refs] });
+    for (const x of refs) placed.add(x);
+  };
+  (r.sections || []).forEach((s, i) => {
+    const page = pages[i] || { visuals: [] };
+    const where = { page: page.displayName || '', pageName: page.name || '' };
+    site('filter', { ...where, label: 'page filter', detail: '' }, reportRefsOf(parse(s.filters)));
+    site('format', { ...where, label: 'page settings', detail: '' }, reportRefsOf(parse(s.config)));
+    const byId = new Map(page.visuals.map(v => [v.id, v]));
+    for (const vc of (s.visualContainers || [])) {
+      const cfg = parse(vc.config) || {};
+      const v = !cfg.singleVisualGroup && byId.get(cfg.name || '');
+      if (!v) continue;
+      const sv = cfg.singleVisual || {};
+      for (const f of v.fields) { const q = parseQueryRef(f.ref); if (q) placed.add(`${q.table}.${q.field}`); }
+      visualSites(site, { ...where, label: visualLabel(v).text || v.type }, v,
+        reportRefsOf([cfg, parse(vc.query), parse(vc.dataTransforms)]),
+        parse(vc.filters), [sv.objects, sv.vcObjects], sv.prototypeQuery && sv.prototypeQuery.OrderBy);
+    }
+  });
+  const cfg = parse(r.config) || {};
+  for (const item of (Array.isArray(cfg.bookmarks) ? cfg.bookmarks : [])) {
+    for (const b of (item && Array.isArray(item.children) ? item.children : [item])) {
+      const n = normaliseBookmark(b);
+      if (!n) continue;
+      const pg = pages.find(p => p.name === n.page);
+      site('bookmark', { page: pg ? pg.displayName : '', pageName: n.page, label: n.name, detail: '' }, reportRefsOf(b));
+    }
+  }
+  const reportFilters = reportRefsOf(parse(r.filters));
+  site('filter', { page: '', pageName: '', label: 'report filter', detail: '' }, reportFilters);
+  site('format', { page: '', pageName: '', label: 'report settings', detail: '' }, setMinus(fileRefs, placed));
+  return sites;
 }
 
 /* A report whose model isn't in the project: live-connected (byConnection), or a byPath folder that
@@ -4084,7 +4273,7 @@ async function loadReportOnly(byPath, report) {
       tables: [], expressions: {}, relationships: [], sources: [], modelAnnotations: {}, functions: [], roles: [], perspectives: [],
     });
     const res = await parseReportFolder(byPath, report);
-    Object.assign(App.state, { pages: res.pages, reportReferences: res.references, reportFieldRefs: res.fieldRefs, reportMeasures: res.reportMeasures, bookmarks: res.bookmarks, pageBookmark: {} });
+    Object.assign(App.state, { pages: res.pages, reportReferences: res.references, reportFieldRefs: res.fieldRefs, reportSites: res.sites || [], reportMeasures: res.reportMeasures, bookmarks: res.bookmarks, pageBookmark: {} });
     buildUsageIndex();
     App.els.emptyState.classList.add('hidden');
     App.els.projectName.textContent = report.name;
@@ -4262,13 +4451,16 @@ async function loadProject(byPath, project) {
       const rn = reports[i].name;
       for (const p of res.pages) { p.pageId = p.name; p.report = rn; p.name = `${rn}/${p.name}`; p.displayName = `${rn} · ${p.displayName}`; }
       for (const b of res.bookmarks) { b.page = `${rn}/${b.page}`; b.report = rn; }
+      for (const st of (res.sites || [])) { st.page = st.page ? `${rn} · ${st.page}` : rn; st.pageName = st.pageName ? `${rn}/${st.pageName}` : ''; }
     });
   }
   App.state.pages = parsed.flatMap(res => res.pages);
   App.state.reportReferences = new Set(parsed.flatMap(res => [...res.references]));
+  App.state.reportSites = parsed.flatMap(res => res.sites || []);
   App.state.reportMeasures = parsed.flatMap(res => res.reportMeasures);
   App.state.bookmarks = parsed.flatMap(res => res.bookmarks);
   App.state.pageBookmark = {};
+  App.state.usageOpen = new Set();
 
   // Roles and perspectives also reference model objects, and nothing else in the project
   // does. A column used only by an RLS filter, or a measure exposed only through a
@@ -5088,6 +5280,7 @@ function renderMeasures() {
     groups[key].items.push(m);
   }
   const groupList = Object.values(groups);
+  const cardKeys = [];   // data-usage index → measure key (names stay out of attributes)
 
   c.innerHTML = `
     ${reportOnly ? `<div style="color:var(--text-2);font-size:12px;margin-bottom:12px;line-height:1.55">Report-level measures: defined in this report, not its semantic model. ${modelWhereHtml()}, so the model's own measures aren't listed here.</div>` : ''}
@@ -5105,12 +5298,20 @@ function renderMeasures() {
           </div>
           ${g.items.map(m => {
             const key = `${m.table}.${m.name}`;
+            // A model measure's usage panel opens from its header (report-level measures have none).
+            const e = App.state.usage && App.state.usage.byKey[key];
+            const open = !!e && App.state.usageOpen.has(key);
+            const i = e ? cardKeys.push(key) - 1 : -1;
             return `
             <div class="measure-item ${measureItemClassFor(key)}">
-              <div class="measure-head">
+              <div class="measure-head${e ? ' has-usage' : ''}"${e ? ` data-usage="${i}"` : ''}>
                 <div class="measure-name">${highlight(m.name, filter)}${pillFor(key)}</div>
-                ${m.formatString ? `<div class="measure-format">${esc(m.formatString)}</div>` : ''}
+                <div class="measure-head-right">
+                  ${m.formatString ? `<div class="measure-format">${esc(m.formatString)}</div>` : ''}
+                  ${e ? usageToggleHtml(e.uses, open) : ''}
+                </div>
               </div>
+              ${open ? usagePanelHtml(e.uses) : ''}
               <pre class="measure-dax">${highlight(m.dax, filter)}</pre>
               ${measureExtrasHtml(m, filter)}
             </div>
@@ -5135,12 +5336,68 @@ function renderMeasures() {
       </div>
     ` : ''}
   `;
+  // A measure's header opens or closes its usage panel in place (no re-render, so the filter box
+  // and the scroll position stay put); a page named in a panel opens on the Pages tab.
+  c.querySelectorAll('.measure-head[data-usage]').forEach(head => {
+    head.onclick = () => {
+      if (window.getSelection && String(window.getSelection())) return;   // selecting text, not toggling
+      const key = cardKeys[Number(head.dataset.usage)];
+      const e = App.state.usage.byKey[key];
+      const open = !App.state.usageOpen.has(key);
+      if (open) App.state.usageOpen.add(key); else App.state.usageOpen.delete(key);
+      const panel = head.nextElementSibling;
+      if (panel && panel.classList.contains('usage-panel')) panel.remove();
+      if (open) head.insertAdjacentHTML('afterend', usagePanelHtml(e.uses));
+      head.querySelector('.usage-toggle').outerHTML = usageToggleHtml(e.uses, open);
+    };
+  });
+  c.onclick = (ev) => {
+    const a = ev.target.closest && ev.target.closest('.usage-panel [data-page]');
+    if (!a) return;
+    ev.stopPropagation();
+    const page = App.state.pages[Number(a.dataset.page)];
+    if (page) { App.state.activePage = page.name; switchView('pages'); }
+  };
   const input = document.getElementById('measureSearchInput');
   if (input) {
     input.oninput = () => { App.state.measureFilter = input.value; renderMeasures(); input.focus(); };
     // Restore cursor at end
     setTimeout(() => { input.focus(); input.setSelectionRange(input.value.length, input.value.length); }, 0);
   }
+}
+
+/* The usage panel under a measure: every place that uses it, by kind (buildUsageIndex step 8). A
+   page named in a visual's, filter's or bookmark's entry links to it on the Pages tab. */
+const USAGE_SECTIONS = [
+  ['visual', 'Visuals', 'visual', 'visuals'], ['filter', 'Filters', 'filter', 'filters'],
+  ['format', 'Formatting', 'format setting', 'format settings'], ['bookmark', 'Bookmarks', 'bookmark', 'bookmarks'],
+  ['dax', 'DAX', 'in DAX', 'in DAX'], ['parameter', 'Field parameters', 'field parameter', 'field parameters'],
+  ['perspective', 'Perspectives', 'perspective', 'perspectives'],
+];
+function usageToggleHtml(uses, open) {
+  const parts = USAGE_SECTIONS.map(([sec, , one, many]) => {
+    const n = uses.filter(u => u.section === sec).length;
+    return n ? `${n} ${n === 1 ? one : many}` : '';
+  }).filter(Boolean);
+  return `<button class="usage-toggle" aria-expanded="${open}" title="Where this measure is used">${open ? '▾' : '▸'} ${parts.length ? parts.join(' · ') : 'no uses'}</button>`;
+}
+function usagePanelHtml(uses) {
+  if (!uses.length) return '<div class="usage-panel"><div class="usage-none">Nothing uses this measure: no visual, filter, formatting, bookmark or DAX names it.</div></div>';
+  const pageIndex = new Map(App.state.pages.map((p, i) => [p.name, i]));
+  return `<div class="usage-panel">${USAGE_SECTIONS.map(([sec, title]) => {
+    const items = uses.filter(u => u.section === sec);
+    if (!items.length) return '';
+    return `<div class="usage-sec">
+      <div class="usage-sec-title">${title} <span class="usage-count">${items.length}</span></div>
+      <ul>${items.map(u => {
+        const at = pageIndex.get(u.pageName);
+        const page = !u.page ? '' : at != null
+          ? `<a class="usage-page" data-page="${at}" title="Open this page">${esc(u.page)}</a> · `
+          : `<span class="usage-page">${esc(u.page)}</span> · `;
+        return `<li>${page}<span class="usage-what">${esc(u.label)}</span>${u.detail ? ` <span class="usage-detail">${esc(u.detail)}</span>` : ''}${u.unused ? ' <span class="usage-pill" title="Itself unused, so this use doesn\'t count">unused</span>' : ''}</li>`;
+      }).join('')}</ul>
+    </div>`;
+  }).join('')}</div>`;
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -6245,6 +6502,18 @@ function renderNotes() {
       <li>Quoted identifiers (<code>#"…"</code>) are preserved in both passes — they really are identifiers.</li>
     </ul>
     <p>Iterative: marking a column as used makes that column's table "used," which may trigger further M-reference propagation. Bounded at 50 iterations.</p>
+
+    <h3>9.4 Where a measure is used (the Measures tab's usage panel)</h3>
+    <p>Each measure's header carries a summary — <em>2 visuals · 1 filter · 3 in DAX</em> — and a click opens the panel under it, closed by default. It lists every place that names the measure, by kind, from <code>buildUsageIndex</code> step 8:</p>
+    <ul>
+      <li><strong>Visuals</strong> — page, visual (its title, textbox text or auto label), type and the roles the measure fills; also a visual sorted by it, or naming it anywhere else in its settings (expansion state, a stale name).</li>
+      <li><strong>Filters</strong> — a visual's, a page's or the report's filters.</li>
+      <li><strong>Formatting</strong> — conditional formatting, a dynamic title and other visual, page or report settings.</li>
+      <li><strong>Bookmarks</strong> — the bookmarks whose captured state names it.</li>
+      <li><strong>DAX</strong> — other measures (their format strings and KPIs included), calculated columns, calculation items, security roles, DAX functions and report-level measures.</li>
+      <li><strong>Field parameters</strong> and <strong>perspectives</strong>.</li>
+    </ul>
+    <p>The report parsers record where each reference sits as they walk each file (PBIR: <code>visual.json</code>'s <code>filterConfig</code>, <code>visual.objects</code> / <code>visualContainerObjects</code> and <code>query.sortDefinition</code>; <code>page.json</code>'s and <code>report.json</code>'s <code>filterConfig</code>; each bookmark file. Legacy: each visual container's <code>filters</code>, <code>objects</code> / <code>vcObjects</code> and <code>prototypeQuery.OrderBy</code>, each section's <code>filters</code>, the report's <code>filters</code> and <code>config.bookmarks</code>), and what's left in a file goes under its settings, so everything that counts toward usage appears somewhere. The panel lists places, not verdicts: a reference from something nobody uses — a measure no visual shows, a field parameter or calculation group nobody uses — is listed but marked <em>unused</em>, which is how a dead chain shows; a measure nothing names gets an empty panel. A page in an entry opens on the Pages tab. Nothing here changes what counts as used.</p>
 
     <h2>10. Relationships graph (D3 v7)</h2>
     <p>Uses <strong>D3.js v7</strong> embedded inline in this HTML file (~280 KB minified, the full bundle is pre-resolved so all internal module dependencies are wired up correctly). D3 is the only third-party code in the file — everything else is vanilla.</p>
