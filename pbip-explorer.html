@@ -3374,24 +3374,49 @@ function parseLegacyBookmarks(reportText) {
    case the item keeps whatever state it was in. A group the bookmark leaves alone keeps its
    default, so a visual the bookmark shows inside a group that stays hidden is 'via group'. */
 function bookmarkState(bookmark, item, isGroup, groupsById) {
-  const own = (it, group) => {
-    if (!bookmark.display) return '';
-    if (bookmark.targets && !bookmark.targets.includes(it.id)) return '';
-    return (group ? bookmark.groups : bookmark.visuals)[it.id] || '';
-  };
-  const s = own(item, isGroup);
+  const s = bookmarkSets(bookmark, item, isGroup);
   if (s === 'hidden') return 'hidden';
   let hiddenByBookmark = false, hiddenByDefault = false;
   const seen = new Set();
   for (let g = groupsById.get(item.parentGroup); g && !seen.has(g.id); g = groupsById.get(g.parentGroup)) {
     seen.add(g.id);
-    const gs = own(g, true);
+    const gs = bookmarkSets(bookmark, g, true);
     if (gs === 'hidden') hiddenByBookmark = true;
     else if (!gs && g.isHidden) hiddenByDefault = true;
   }
   if (hiddenByBookmark) return 'via group';
   if (s === 'shown') return hiddenByDefault ? 'via group' : 'shown';
   return '';
+}
+
+/* The state a bookmark sets an item to itself — 'shown' | 'hidden' — or '' when it leaves the item
+   alone: it doesn't capture display, the item is outside its selected visuals, or the item didn't
+   exist when it was captured. */
+function bookmarkSets(bookmark, item, isGroup) {
+  if (!bookmark.display) return '';
+  if (bookmark.targets && !bookmark.targets.includes(item.id)) return '';
+  return (isGroup ? bookmark.groups : bookmark.visuals)[item.id] || '';
+}
+
+/* What a visual or group looks like once `bookmark` is applied to the page as it is saved:
+   { state: 'shown' | 'hidden' | 'via group', sets }. `sets` = the bookmark sets the item itself or a
+   group around it. An item it leaves alone — on a "selected visuals" bookmark, every visual outside
+   the selection — keeps the state the page saves it in, and a group the bookmark sets carries its
+   members along: showing a group hidden by default shows the visuals in it. For the Pages tab's
+   preview, which assumes the page as saved (it can't know what was clicked before); the export's
+   matrix keeps bookmarkState, whose "—" leaves that open beside a Default column. */
+function bookmarkEffect(bookmark, item, isGroup, groupsById) {
+  const own = bookmarkSets(bookmark, item, isGroup);
+  let sets = !!own, groupHidden = false;
+  const seen = new Set();
+  for (let g = groupsById.get(item.parentGroup); g && !seen.has(g.id); g = groupsById.get(g.parentGroup)) {
+    seen.add(g.id);
+    const gs = bookmarkSets(bookmark, g, true);
+    if (gs) sets = true;
+    if (gs ? gs === 'hidden' : g.isHidden) groupHidden = true;
+  }
+  const hidden = own ? own === 'hidden' : !!item.isHidden;
+  return { state: hidden ? 'hidden' : groupHidden ? 'via group' : 'shown', sets };
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -5835,12 +5860,16 @@ function visualRowHtml(v, groupsById, search, bookmark) {
   const group = groupsById.get(v.parentGroup);
   let pill = '', untouched = false;
   if (bookmark) {
-    const st = bookmarkState(bookmark, v, false, groupsById);
-    untouched = !st;
-    pill = st === 'shown' ? '<span class="usage-pill shown" title="Shown by this bookmark">shown</span>'
-      : st === 'hidden' ? '<span class="usage-pill" title="Hidden by this bookmark">hidden</span>'
-      : st === 'via group' ? '<span class="usage-pill" title="Its group is hidden under this bookmark">hidden · group</span>'
-      : '<span class="usage-pill structural" title="This bookmark doesn\'t change it; it keeps its current state">unchanged</span>';
+    // What the page shows once the bookmark applies: a visual it leaves alone keeps its saved state.
+    // Faded = hidden then.
+    const { state, sets } = bookmarkEffect(bookmark, v, false, groupsById);
+    untouched = state !== 'shown';
+    const word = state === 'shown' ? 'shown' : state === 'hidden' ? 'hidden' : 'hidden · group';
+    pill = !sets
+      ? `<span class="usage-pill structural" title="This bookmark leaves it alone: it stays as the page is saved (unless something clicked before changed it)">${word} · unchanged</span>`
+      : state === 'shown' ? '<span class="usage-pill shown" title="Shown under this bookmark">shown</span>'
+      : state === 'hidden' ? '<span class="usage-pill" title="Hidden by this bookmark">hidden</span>'
+      : '<span class="usage-pill" title="Its group is hidden under this bookmark">hidden · group</span>';
   } else {
     const hidden = hiddenState(v, groupsById);
     if (hidden) pill = `<span class="usage-pill" title="${hidden === 'yes' ? 'Hidden' : 'Hidden because its group is hidden'}">${hidden === 'yes' ? 'hidden' : 'hidden · group'}</span>`;
@@ -5989,8 +6018,8 @@ function renderSinglePageDetail(root) {
         ${bms.map((b, i) => `<option value="${i}"${i === bmIndex ? ' selected' : ''}>${esc(b.folder ? `${b.folder} / ${b.name}` : b.name)}</option>`).join('')}
       </select>
       ${bookmark ? `<span style="color:var(--text-3)">${bookmark.display
-        ? `${bookmark.targets ? `applies to ${bookmark.targets.length} selected visual${bookmark.targets.length === 1 ? '' : 's'}` : 'applies to all visuals'}; faded rows keep their current state`
-        : 'doesn\'t capture display — it only changes filters, so no visual changes'}</span>` : ''}
+        ? `${bookmark.targets ? `applies to ${bookmark.targets.length} selected visual${bookmark.targets.length === 1 ? '' : 's'}; the rest stay as the page is saved` : 'applies to all visuals'} · faded rows end up hidden`
+        : 'doesn\'t capture display — it only changes filters, so every visual stays as the page is saved'}</span>` : ''}
     </div>` : ''}
 
     ${visuals.length === 0
@@ -6566,7 +6595,7 @@ function renderNotes() {
       <li><strong>Copy</strong> uses the async Clipboard API with a <code>document.execCommand('copy')</code> fallback for <code>file://</code>; <strong>Download</strong> writes a <code>&lt;projectName&gt;.md</code> via a Blob URL</li>
       <li>Built by <code>buildMarkdownExport(opts)</code> from <code>App.state</code> — same data the other tabs render, so it always reflects the loaded model (legacy or PBIR)</li>
       <li><strong>Report pages</strong> — each page's heading carries <code>· hidden</code> / <code>· drillthrough</code> / <code>· tooltip</code> and its page ID, then a table with one row per visual and per group: <em>Visual ID</em> (the key bookmarks use in <code>targetVisualNames</code> and <code>visualContainers</code> / <code>visualContainerGroups</code>), type, title, hidden (<code>yes</code>, or <code>via group</code> when an enclosing group is hidden — how bookmark-toggled panels usually work), group, fields. The title is the visual's own when set; otherwise the measure driving a dynamic title <em>(dynamic)</em>, a textbox's text <em>(text)</em>, or an auto label shaped like Power BI's default title, e.g. "Sales Amount by Category" <em>(auto)</em> — most visuals set no title of their own.</li>
-      <li><strong>Bookmarks per page</strong> — a table of the page's bookmarks (ID, folder, "all visuals" or <em>N selected visuals</em>, whether it captures display and/or data), then a matrix: one column per bookmark, a <em>Default</em> column, and a row for each visual or group some bookmark leaves differently from its default. Cells: <code>shown</code>, <code>hidden</code>, <code>via group</code> (an enclosing group ends up hidden — how panel bookmarks usually work), or <code>—</code> (the bookmark doesn't touch it: it doesn't capture display, the visual is outside its selected visuals, or the visual was added after it was made). Past six bookmarks the page gets one line per bookmark instead (shows / hides / hidden via group). Bookmarks whose page no longer exists are listed at the end. The Pages tab previews any bookmark on a page the same way.</li>
+      <li><strong>Bookmarks per page</strong> — a table of the page's bookmarks (ID, folder, "all visuals" or <em>N selected visuals</em>, whether it captures display and/or data), then a matrix: one column per bookmark, a <em>Default</em> column, and a row for each visual or group some bookmark leaves differently from its default. Cells: <code>shown</code>, <code>hidden</code>, <code>via group</code> (an enclosing group ends up hidden — how panel bookmarks usually work), or <code>—</code> (the bookmark doesn't touch it: it doesn't capture display, the visual is outside its selected visuals, or the visual was added after it was made). Past six bookmarks the page gets one line per bookmark instead (shows / hides / hidden via group). Bookmarks whose page no longer exists are listed at the end. The Pages tab previews any bookmark on a page, as the page looks once it applies to the page as saved: a visual it leaves alone — on a "selected visuals" bookmark, every visual outside the selection — shows its saved state, marked <em>unchanged</em>, and a group the bookmark shows or hides takes its members along, selected or not. Faded rows end up hidden. (FHSQLMonitor's 70 filter-panel bookmarks select only the panel; the 939 visual rows they leave alone stay on screen.)</li>
     </ul>
 
     <h2>13. Known limitations / TODO</h2>
@@ -6576,7 +6605,7 @@ function renderNotes() {
       <li><strong>Object-level security</strong> (a role's <code>metadataPermission</code> / <code>columnPermission</code>) isn't read, and a role's members aren't shown — only its model permission and row filters.</li>
       <li><strong>Translations / cultures</strong> — present in TMDL but not displayed.</li>
       <li><strong>A live connection is paired by name.</strong> A model folder with the name the connection gives is taken to be the connected model; the connection's workspace and semantic model ID can't be checked against a folder, so a same-named copy (say, a dev model) would be paired too. The Overview says when a report was paired this way.</li>
-      <li><strong>Bookmarks</strong> — a cell is what applying the bookmark does, read from the file; "—" means it leaves the visual in whatever state it's in, which PBIP can't tell you (it depends on what was clicked before). Filter state a bookmark captures is used for field references but not shown. <strong>Themes</strong> aren't parsed.</li>
+      <li><strong>Bookmarks</strong> — a cell is what applying the bookmark does, read from the file; "—" means it leaves the visual in whatever state it's in, which PBIP can't tell you (it depends on what was clicked before). The Pages tab's preview assumes the page as saved, so it shows the saved state there instead. Filter state a bookmark captures is used for field references but not shown. <strong>Themes</strong> aren't parsed.</li>
     </ul>
 
     <h2>14. Is it offline-safe?</h2>

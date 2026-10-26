@@ -5,7 +5,7 @@
 // `children`, suppressActiveSection) and legacy folders holding bookmark objects.
 'use strict';
 const { loadApp, eq, has, hasNot, defined, suite } = require('./harness');
-const X = loadApp(['App', 'parseReport', 'parsePbirReport', 'parseLegacyBookmarks', 'bookmarkState', 'buildMarkdownExport']);
+const X = loadApp(['App', 'parseReport', 'parsePbirReport', 'parseLegacyBookmarks', 'bookmarkState', 'bookmarkEffect', 'visualRowHtml', 'buildMarkdownExport']);
 const { tests, test } = suite();
 
 // ── PBIR fixture: FHSQLMonitor's filter-panel pair ──────────────────────────────────────
@@ -90,6 +90,33 @@ const legacyText = JSON.stringify({
     vc({ name: 's1', parentGroupName: 'g1', singleVisual: { visualType: 'slicer', vcObjects: { title: [{ properties: { text: { expr: { Literal: { Value: "'Review status'" } } } } }] } } }),
     vc({ name: 'c1', singleVisual: { visualType: 'card', projections: { Values: [{ queryRef: 'Sales.Total' }] } } }),
   ] }],
+});
+
+// ── The Pages tab's preview: the page as it looks once the bookmark applies ─────────────
+// A "selected visuals" bookmark leaves every other visual as the page is saved — FHSQLMonitor's
+// filter-panel bookmarks select only the panel, and the page's other visuals stay on screen. A group
+// it sets carries its members along, selected or not.
+test('preview: a visual the bookmark leaves alone shows its saved state; a group it sets takes its members along', () => {
+  const groups = [{ id: 'gOpen', name: 'Filter panel opened', isHidden: true, parentGroup: '' }];
+  const groupsById = new Map(groups.map(g => [g.id, g]));
+  const v = (id, extra = {}) => ({ id, type: 'card', fields: [], x: 0, y: 0, z: 0, width: 1, height: 1, tabOrder: null,
+    parentGroup: '', isHidden: false, title: id, titleExpr: '', text: '', ...extra });
+  const visuals = [v('inPanel', { parentGroup: 'gOpen' }), v('selected'), v('other'), v('otherHidden', { isHidden: true })];
+  const open = { id: 'b', name: 'Open', display: true, data: false, targets: ['gOpen', 'selected'],
+    visuals: { selected: 'hidden' }, groups: { gOpen: 'shown' } };
+  const effect = defined(X.bookmarkEffect, 'bookmarkEffect');
+  eq(visuals.map(x => effect(open, x, false, groupsById)), [
+    { state: 'shown', sets: true },     // not selected itself, but the bookmark shows its group
+    { state: 'hidden', sets: true },
+    { state: 'shown', sets: false },    // outside the selection: as saved, visible
+    { state: 'hidden', sets: false },   // outside the selection: as saved, hidden
+  ], 'effects');
+  eq(X.bookmarkState(open, visuals[0], false, groupsById), '', 'the export still reads the panel visual as untouched');
+  const rows = visuals.map(x => X.visualRowHtml(x, groupsById, '', open));
+  has(rows[2], '>shown · unchanged</span>');
+  has(rows[3], '>hidden · unchanged</span>');
+  has(rows[0], '<span class="usage-pill shown" title="Shown under this bookmark">shown</span>');
+  eq(rows.map(r => r.includes('visual-item untouched')), [false, true, false, true], 'faded = hidden once it applies');
 });
 
 test('legacy: folders flattened, nested group states flattened, page per bookmark', () => {
